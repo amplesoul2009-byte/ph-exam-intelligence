@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg[binary]
+python-telegram-bot
+httpx
+google-genai
+groq
