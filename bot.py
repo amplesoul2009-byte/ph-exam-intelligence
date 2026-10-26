@@ -17,6 +17,7 @@ from database import (
     Question,
     ApprovedGroup,
     GroupAccessRequest,
+    ChatSetting,
     SessionLocal,
     init_db,
 )
@@ -39,6 +40,8 @@ BOT_TOKEN = (
 )
 
 OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "").strip()
+
+DEFAULT_DISPLAY_NAME = "0xGREY"
 
 
 # ==================================================
@@ -67,6 +70,176 @@ async def owner_required(update: Update) -> bool:
 
 
 # ==================================================
+# CUSTOM CHAT DISPLAY NAME
+# ==================================================
+
+def get_chat_display_name(chat_id: int) -> str:
+    """Return the saved display name or the default name."""
+
+    with SessionLocal() as db:
+        setting = (
+            db.query(ChatSetting)
+            .filter_by(chat_id=str(chat_id))
+            .first()
+        )
+
+        if setting and setting.display_name:
+            return setting.display_name
+
+    return DEFAULT_DISPLAY_NAME
+
+
+def get_display_name_safely(chat_id: int) -> str:
+    """Avoid breaking ordinary bot replies if settings cannot be read."""
+
+    try:
+        return get_chat_display_name(chat_id)
+    except Exception:
+        logger.exception(
+            "Could not retrieve display name for chat %s",
+            chat_id,
+        )
+        return DEFAULT_DISPLAY_NAME
+
+
+async def set_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Set the display name for the current chat."""
+
+    if not await owner_required(update):
+        return
+
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if message is None or chat is None or user is None:
+        return
+
+    display_name = " ".join(context.args).strip()
+
+    if not display_name:
+        await message.reply_text(
+            "Usage:\n"
+            "/set_chat_name PH Banking Expert\n\n"
+            "Examples:\n"
+            "/set_chat_name PH Banking Expert\n"
+            "/set_chat_name PH English Mentor\n"
+            "/set_chat_name 0xGREY"
+        )
+        return
+
+    if len(display_name) > 100:
+        await message.reply_text(
+            "❌ The display name must be 100 characters or fewer."
+        )
+        return
+
+    try:
+        with SessionLocal() as db:
+            setting = (
+                db.query(ChatSetting)
+                .filter_by(chat_id=str(chat.id))
+                .first()
+            )
+
+            if setting:
+                setting.display_name = display_name
+                setting.updated_by = str(user.id)
+            else:
+                db.add(
+                    ChatSetting(
+                        chat_id=str(chat.id),
+                        display_name=display_name,
+                        updated_by=str(user.id),
+                    )
+                )
+
+            db.commit()
+
+        await message.reply_text(
+            "✅ CHAT DISPLAY NAME UPDATED\n\n"
+            f"🏷️ Name: {display_name}\n"
+            f"🆔 Chat ID: {chat.id}\n\n"
+            "Supported bot messages will use this name."
+        )
+
+    except Exception:
+        logger.exception("Failed to update chat display name")
+
+        await message.reply_text(
+            "❌ Could not save the display name. "
+            "Check the hosting logs."
+        )
+
+
+async def get_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Display the saved name for the current chat."""
+
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    display_name = get_display_name_safely(chat.id)
+
+    await message.reply_text(
+        "🏷️ CHAT DISPLAY NAME\n\n"
+        f"Name: {display_name}\n"
+        f"Chat ID: {chat.id}"
+    )
+
+
+async def reset_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Remove the custom name and restore the default."""
+
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    try:
+        with SessionLocal() as db:
+            setting = (
+                db.query(ChatSetting)
+                .filter_by(chat_id=str(chat.id))
+                .first()
+            )
+
+            if setting:
+                db.delete(setting)
+                db.commit()
+
+        await message.reply_text(
+            "✅ Chat display name reset.\n"
+            f"Default name: {DEFAULT_DISPLAY_NAME}"
+        )
+
+    except Exception:
+        logger.exception("Failed to reset chat display name")
+
+        await message.reply_text(
+            "❌ Could not reset the display name."
+        )
+
+
+# ==================================================
 # GROUP ACCESS HELPERS
 # ==================================================
 
@@ -87,10 +260,7 @@ def get_approved_group(group_id: str):
 async def check_publish_permission(
     update: Update,
 ) -> bool:
-    """
-    In groups, only publish if the group is approved.
-    The owner can still test polls in private chat.
-    """
+    """Check whether the current group is approved."""
 
     chat = update.effective_chat
 
@@ -114,6 +284,31 @@ async def check_publish_permission(
     return True
 
 
+async def check_publish_permission_for_target(
+    update: Update,
+    target_chat_id: int,
+) -> bool:
+    """Ensure a group target is actively approved."""
+
+    # Positive Telegram chat IDs represent private chats.
+    # Owner-only quiz publishing can be tested in private chat.
+    if target_chat_id > 0:
+        return True
+
+    approved = get_approved_group(str(target_chat_id))
+
+    if approved is None:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "⛔ Publishing blocked.\n\n"
+                "The target group is not currently approved.\n"
+                "Use /approved_groups to check approved groups."
+            )
+        return False
+
+    return True
+
+
 # ==================================================
 # START
 # ==================================================
@@ -122,8 +317,16 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.effective_message.reply_text(
-        "🎓 Welcome to 0xGREY!\n\n"
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    display_name = get_display_name_safely(chat.id)
+
+    await message.reply_text(
+        f"🎓 Welcome to {display_name}!\n\n"
         "Premium Mock Test Platform\n\n"
         "📚 Question Bank\n"
         "📝 Telegram Quiz Polls\n"
@@ -143,28 +346,41 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    await update.effective_message.reply_text(
-        "📌 0xGREY COMMANDS\n\n"
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    display_name = get_display_name_safely(chat.id)
+
+    await message.reply_text(
+        f"📌 {display_name.upper()} COMMANDS\n\n"
 
         "GENERAL\n"
         "/start — Start the bot\n"
         "/help — Show commands\n"
         "/status — Bot status\n\n"
 
-        "OWNER-ONLY QUESTION BANK\n"
+        "CUSTOM CHAT DISPLAY NAME — OWNER ONLY\n"
+        "/set_chat_name NAME — Set this chat's name\n"
+        "/get_chat_name — Show this chat's name\n"
+        "/reset_chat_name — Restore default name\n\n"
+
+        "QUESTION BANK — OWNER ONLY\n"
         "/addcategory English\n"
         "/categories\n"
         "/addquestion English\n"
         "/questioncount\n\n"
 
-        "QUIZ POLLS\n"
+        "QUIZ POLLS — OWNER ONLY\n"
         "/testpoll — Send a demo poll\n"
         "/publishquiz English 5\n"
         "/publishquiz Banking Awareness 10\n"
-        "/publishquiz_to GROUP_ID 5 English\n\n"
+        "/publishquiz_to GROUP_ID COUNT CATEGORY\n\n"
 
         "GROUP ACCESS\n"
-        "/request_access — Request approval in a group\n"
+        "/request_access — Request group approval\n"
         "/pending_groups — View pending requests (owner)\n"
         "/approve_group GROUP_ID — Approve a group (owner)\n"
         "/revoke_group GROUP_ID — Revoke a group (owner)\n"
@@ -191,15 +407,23 @@ async def status(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    display_name = get_display_name_safely(chat.id)
+
     if is_owner(update):
-        message = (
-            "✅ 0xGREY is running.\n"
+        response = (
+            f"✅ {display_name} is running.\n"
             "👑 Owner access recognised."
         )
     else:
-        message = "✅ 0xGREY is running."
+        response = f"✅ {display_name} is running."
 
-    await update.effective_message.reply_text(message)
+    await message.reply_text(response)
 
 
 # ==================================================
@@ -224,7 +448,6 @@ async def request_access(
         )
         return
 
-    # Only group administrators or the creator can request access.
     try:
         member = await context.bot.get_chat_member(
             chat_id=chat.id,
@@ -279,7 +502,6 @@ async def request_access(
                 )
                 return
 
-            # Reuse the latest request record if one exists.
             previous = (
                 db.query(GroupAccessRequest)
                 .filter(
@@ -318,9 +540,14 @@ async def request_access(
             "Approval is not automatic."
         )
 
-        # Notify the owner if the owner has opened the bot privately.
         if OWNER_ID:
             try:
+                username_text = (
+                    f"Username: @{user.username}"
+                    if user.username
+                    else "Username: unavailable"
+                )
+
                 await context.bot.send_message(
                     chat_id=int(OWNER_ID),
                     text=(
@@ -328,16 +555,10 @@ async def request_access(
                         f"📚 Group: {chat.title or 'Unnamed group'}\n"
                         f"🆔 Group ID: {chat.id}\n"
                         f"👤 Requested by: {user.id}\n"
-                        f"Username: @{user.username}"
-                        if user.username
-                        else (
-                            "📨 NEW GROUP ACCESS REQUEST\n\n"
-                            f"📚 Group: {chat.title or 'Unnamed group'}\n"
-                            f"🆔 Group ID: {chat.id}\n"
-                            f"👤 Requested by: {user.id}"
-                        )
+                        f"{username_text}"
                     ),
                 )
+
             except TelegramError:
                 logger.info(
                     "Could not DM owner about group access request."
@@ -367,15 +588,13 @@ async def pending_groups(
         with SessionLocal() as db:
             requests = (
                 db.query(GroupAccessRequest)
-                .filter(
-                    GroupAccessRequest.status == "pending"
-                )
+                .filter(GroupAccessRequest.status == "pending")
                 .order_by(GroupAccessRequest.requested_at.asc())
                 .all()
             )
 
             if not requests:
-                message = "📭 There are no pending group requests."
+                response = "📭 There are no pending group requests."
             else:
                 lines = ["📨 PENDING GROUP REQUESTS\n"]
 
@@ -387,9 +606,9 @@ async def pending_groups(
                         f"Use: /approve_group {request.group_id}\n"
                     )
 
-                message = "\n".join(lines)
+                response = "\n".join(lines)
 
-        await update.effective_message.reply_text(message)
+        await update.effective_message.reply_text(response)
 
     except Exception:
         logger.exception("Failed to list pending group requests")
@@ -483,15 +702,17 @@ async def approve_group(
             "This group can now receive quizzes."
         )
 
-        # Notify the group, if the bot can send a message there.
         try:
+            target_display_name = get_display_name_safely(int(group_id))
+
             await context.bot.send_message(
                 chat_id=int(group_id),
                 text=(
-                    "✅ 0xGREY GROUP ACCESS APPROVED\n\n"
+                    f"✅ {target_display_name} GROUP ACCESS APPROVED\n\n"
                     "This group is now authorised to receive quizzes."
                 ),
             )
+
         except (TelegramError, ValueError):
             logger.info(
                 "Group approved, but notification could not be delivered."
@@ -501,8 +722,7 @@ async def approve_group(
         logger.exception("Failed to approve group")
 
         await update.effective_message.reply_text(
-            "❌ Could not approve the group. "
-            "Check the hosting logs."
+            "❌ Could not approve the group. Check the hosting logs."
         )
 
 
@@ -529,9 +749,7 @@ async def revoke_group(
         with SessionLocal() as db:
             group = (
                 db.query(ApprovedGroup)
-                .filter(
-                    ApprovedGroup.group_id == group_id
-                )
+                .filter(ApprovedGroup.group_id == group_id)
                 .first()
             )
 
@@ -543,7 +761,6 @@ async def revoke_group(
 
             group.active = False
 
-            # Preserve the audit history and revoke pending requests too.
             (
                 db.query(GroupAccessRequest)
                 .filter(
@@ -595,7 +812,7 @@ async def approved_groups(
             )
 
             if not groups:
-                message = "📭 No groups are currently approved."
+                response = "📭 No groups are currently approved."
             else:
                 lines = ["🔐 APPROVED GROUPS\n"]
 
@@ -605,9 +822,9 @@ async def approved_groups(
                         f"🆔 ID: {group.group_id}\n"
                     )
 
-                message = "\n".join(lines)
+                response = "\n".join(lines)
 
-        await update.effective_message.reply_text(message)
+        await update.effective_message.reply_text(response)
 
     except Exception:
         logger.exception("Failed to list approved groups")
@@ -672,8 +889,7 @@ async def add_category(
         logger.exception("Failed to create category")
 
         await update.effective_message.reply_text(
-            "❌ Could not create the category. "
-            "Check the hosting logs."
+            "❌ Could not create the category. Check hosting logs."
         )
 
 
@@ -697,7 +913,7 @@ async def list_categories(
             )
 
             if not categories:
-                message = "📚 No categories found."
+                response = "📚 No categories found."
             else:
                 lines = ["📚 QUESTION BANK\n"]
 
@@ -715,9 +931,9 @@ async def list_categories(
                         f"• {category.name}: {count} questions"
                     )
 
-                message = "\n".join(lines)
+                response = "\n".join(lines)
 
-        await update.effective_message.reply_text(message)
+        await update.effective_message.reply_text(response)
 
     except Exception:
         logger.exception("Failed to list categories")
@@ -738,7 +954,8 @@ async def add_question(
     if not await owner_required(update):
         return
 
-    raw_text = update.effective_message.text or ""
+    message = update.effective_message
+    raw_text = message.text or ""
     lines = raw_text.splitlines()
 
     if not lines:
@@ -747,7 +964,7 @@ async def add_question(
     command_parts = lines[0].split(maxsplit=1)
 
     if len(command_parts) != 2:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Usage:\n"
             "/addquestion English\n"
             "Question: What is 2 + 2?\n"
@@ -762,7 +979,6 @@ async def add_question(
         return
 
     category_name = command_parts[1].strip()
-
     fields = {}
 
     for line in lines[1:]:
@@ -786,19 +1002,19 @@ async def add_question(
         option_c,
         option_d,
     ]):
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ The question and all four options are required."
         )
         return
 
     if correct_option not in {"A", "B", "C", "D"}:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ Correct must be A, B, C, or D."
         )
         return
 
     if difficulty not in {"Easy", "Moderate", "Difficult"}:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ Difficulty must be Easy, Moderate, or Difficult."
         )
         return
@@ -816,7 +1032,7 @@ async def add_question(
             )
 
             if category is None:
-                await update.effective_message.reply_text(
+                await message.reply_text(
                     f"❌ Category '{category_name}' not found.\n"
                     f"Create it first with /addcategory {category_name}"
                 )
@@ -841,7 +1057,7 @@ async def add_question(
             db.commit()
             question_id = question.id
 
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "✅ QUESTION SAVED\n\n"
             f"🆔 ID: {question_id}\n"
             f"📚 Category: {category_name}\n"
@@ -853,7 +1069,7 @@ async def add_question(
     except Exception:
         logger.exception("Failed to save question")
 
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ Could not save the question. Check hosting logs."
         )
 
@@ -904,14 +1120,22 @@ async def test_poll(
     if not await owner_required(update):
         return
 
-    await update.effective_message.reply_text(
-        "📊 Publishing a sample quiz poll..."
+    chat = update.effective_chat
+    message = update.effective_message
+
+    if chat is None or message is None:
+        return
+
+    display_name = get_display_name_safely(chat.id)
+
+    await message.reply_text(
+        f"📊 {display_name}: Publishing a sample quiz poll..."
     )
 
     try:
         await context.bot.send_poll(
-            chat_id=update.effective_chat.id,
-            question="0xGREY Demo Quiz: What is 2 + 2?",
+            chat_id=chat.id,
+            question=f"{display_name} Demo Quiz: What is 2 + 2?",
             options=["3", "4", "5", "6"],
             type="quiz",
             correct_option_id=1,
@@ -922,7 +1146,7 @@ async def test_poll(
     except TelegramError:
         logger.exception("Failed to send demo poll")
 
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ Could not send the demo poll. Check bot permissions."
         )
 
@@ -932,7 +1156,7 @@ async def test_poll(
 # ==================================================
 
 def load_quiz_questions(category_name: str, requested_count: int):
-    """Return a category name and detached question data."""
+    """Return detached quiz data."""
 
     with SessionLocal() as db:
         categories = db.query(Category).all()
@@ -965,17 +1189,17 @@ def load_quiz_questions(category_name: str, requested_count: int):
 
         quiz_data = [
             {
-                "question": q.question_text,
+                "question": question.question_text,
                 "options": [
-                    ("A", q.option_a),
-                    ("B", q.option_b),
-                    ("C", q.option_c),
-                    ("D", q.option_d),
+                    ("A", question.option_a),
+                    ("B", question.option_b),
+                    ("C", question.option_c),
+                    ("D", question.option_d),
                 ],
-                "correct": q.correct_option,
-                "explanation": q.explanation or "",
+                "correct": question.correct_option,
+                "explanation": question.explanation or "",
             }
-            for q in selected
+            for question in selected
         ]
 
         return category.name, quiz_data, None
@@ -993,7 +1217,7 @@ async def send_quiz_polls(
     requested_count: int,
     announce_in_current_chat: bool = True,
 ):
-    """Publish shuffled Telegram quiz polls to a specified chat."""
+    """Publish shuffled Telegram quiz polls."""
 
     if not await check_publish_permission_for_target(
         update,
@@ -1006,35 +1230,39 @@ async def send_quiz_polls(
         requested_count,
     )
 
+    message = update.effective_message
+
     if error == "category_not_found":
-        await update.effective_message.reply_text(
+        await message.reply_text(
             f"❌ Category '{category_name}' not found.\n"
             "Use /categories to check category names."
         )
         return
 
     if error == "no_questions":
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ This category has no active questions."
         )
         return
 
     if not quiz_data:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "❌ No questions are available."
         )
         return
 
     if len(quiz_data) < requested_count:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             f"⚠️ You requested {requested_count} questions, "
             f"but only {len(quiz_data)} are available.\n"
             f"Publishing the available {len(quiz_data)}."
         )
 
+    display_name = get_display_name_safely(target_chat_id)
+
     if announce_in_current_chat:
-        await update.effective_message.reply_text(
-            f"📢 Publishing {len(quiz_data)} quiz polls "
+        await message.reply_text(
+            f"📢 {display_name}: Publishing {len(quiz_data)} quiz polls "
             f"for {actual_category}.\n\n"
             f"🆔 Target chat: {target_chat_id}\n"
             "Each question will appear as a separate Telegram quiz poll."
@@ -1058,7 +1286,10 @@ async def send_quiz_polls(
             if label == item["correct"]
         )
 
-        question_text = item["question"][:300]
+        question_text = (
+            f"{display_name}: {item['question']}"
+        )[:300]
+
         explanation = item["explanation"][:200] or None
 
         try:
@@ -1082,38 +1313,13 @@ async def send_quiz_polls(
                 target_chat_id,
             )
 
-    # If publishing to a different group, report completion privately
-    # in the chat where the owner issued the command.
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "🏁 QUIZ PUBLISHING FINISHED\n\n"
         f"📚 Category: {actual_category}\n"
         f"🆔 Target chat: {target_chat_id}\n"
         f"✅ Polls published: {sent}\n"
         f"❌ Failed: {failed}"
     )
-
-
-async def check_publish_permission_for_target(
-    update: Update,
-    target_chat_id: int,
-) -> bool:
-    """Ensure any group target is actively approved."""
-
-    # Private chat targets are allowed for owner testing.
-    if target_chat_id > 0:
-        return True
-
-    approved = get_approved_group(str(target_chat_id))
-
-    if approved is None:
-        await update.effective_message.reply_text(
-            "⛔ Publishing blocked.\n\n"
-            "The target group is not currently approved.\n"
-            "Use /approved_groups to check approved groups."
-        )
-        return False
-
-    return True
 
 
 # ==================================================
@@ -1188,10 +1394,8 @@ async def publish_quiz_to(
         )
         return
 
-    group_id_text = context.args[0].strip()
-
     try:
-        group_id = int(group_id_text)
+        group_id = int(context.args[0].strip())
         count = int(context.args[1])
     except ValueError:
         await update.effective_message.reply_text(
@@ -1253,7 +1457,7 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN is missing. "
-            "Configure it in FadeHost environment variables."
+            "Configure it in hosting environment variables."
         )
 
     if not OWNER_ID.isdigit():
@@ -1273,6 +1477,17 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
+
+    # Custom chat display name
+    application.add_handler(
+        CommandHandler("set_chat_name", set_chat_name)
+    )
+    application.add_handler(
+        CommandHandler("get_chat_name", get_chat_name)
+    )
+    application.add_handler(
+        CommandHandler("reset_chat_name", reset_chat_name)
+    )
 
     # Question bank
     application.add_handler(
