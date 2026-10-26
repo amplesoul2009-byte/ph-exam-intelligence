@@ -237,7 +237,6 @@ class StudentAttempt(Base):
 class ApprovedGroup(Base):
     __tablename__ = "approved_groups"
 
-    # Telegram group IDs are stored as strings.
     group_id: Mapped[str] = mapped_column(
         String(50), primary_key=True
     )
@@ -304,6 +303,41 @@ class GroupAccessRequest(Base):
 
 
 # ==================================================
+# CUSTOM BOT NAME PER CHAT
+# ==================================================
+
+class ChatSetting(Base):
+    __tablename__ = "chat_settings"
+
+    # Unique Telegram chat ID
+    chat_id: Mapped[str] = mapped_column(
+        String(50),
+        primary_key=True,
+    )
+
+    # Name displayed in this chat's bot messages
+    display_name: Mapped[str] = mapped_column(
+        String(100),
+        default="0xGREY",
+        nullable=False,
+    )
+
+    # Owner Telegram ID who last changed the name
+    updated_by: Mapped[str] = mapped_column(
+        String(50),
+        default="",
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+
+# ==================================================
 # DATABASE INITIALIZATION
 # ==================================================
 
@@ -332,3 +366,4 @@ if __name__ == "__main__":
     print("0xGREY database initialized successfully.")
     print("Question bank and quiz tables are available.")
     print("Group approval tables are available.")
+    print("Custom chat-name settings are available.")
