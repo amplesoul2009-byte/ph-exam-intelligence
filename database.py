@@ -19,6 +19,7 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
+
 # ==================================================
 # DATABASE CONFIGURATION
 # ==================================================
@@ -32,7 +33,7 @@ engine_options = {}
 
 if DATABASE_URL.startswith("sqlite"):
     engine_options["connect_args"] = {
-        "check_same_thread": False
+        "check_same_thread": False,
     }
 
 engine = create_engine(
@@ -41,9 +42,9 @@ engine = create_engine(
 )
 
 SessionLocal = sessionmaker(
-    bind=engine,
+    autocommit=False,
     autoflush=False,
-    expire_on_commit=False,
+    bind=engine,
 )
 
 
@@ -56,100 +57,149 @@ class Base(DeclarativeBase):
 
 
 # ==================================================
-# CATEGORIES
+# CATEGORY
 # ==================================================
 
 class Category(Base):
     __tablename__ = "categories"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     name: Mapped[str] = mapped_column(
-        String(100), unique=True, index=True
+        String(100),
+        unique=True,
+        nullable=False,
+        index=True,
     )
 
     description: Mapped[str] = mapped_column(
-        Text, default=""
+        Text,
+        default="",
+        nullable=False,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
     questions: Mapped[list["Question"]] = relationship(
-        back_populates="category"
+        back_populates="category",
+        cascade="all, delete-orphan",
     )
 
 
 # ==================================================
-# QUESTION BANK
+# QUESTION
 # ==================================================
 
 class Question(Base):
     __tablename__ = "questions"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     category_id: Mapped[int] = mapped_column(
-        ForeignKey("categories.id"), index=True
+        ForeignKey("categories.id"),
+        nullable=False,
+        index=True,
     )
 
-    question_text: Mapped[str] = mapped_column(Text)
-    option_a: Mapped[str] = mapped_column(Text)
-    option_b: Mapped[str] = mapped_column(Text)
-    option_c: Mapped[str] = mapped_column(Text)
-    option_d: Mapped[str] = mapped_column(Text)
+    question_text: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    option_a: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    option_b: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    option_c: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    option_d: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
 
     correct_option: Mapped[str] = mapped_column(
-        String(1)
+        String(1),
+        nullable=False,
     )
 
     explanation: Mapped[str] = mapped_column(
-        Text, default=""
+        Text,
+        default="",
+        nullable=False,
     )
 
     difficulty: Mapped[str] = mapped_column(
-        String(20), default="Moderate"
+        String(20),
+        default="Moderate",
+        nullable=False,
     )
 
     marks: Mapped[float] = mapped_column(
-        Float, default=1.0
+        Float,
+        default=1.0,
+        nullable=False,
     )
 
     negative_marks: Mapped[float] = mapped_column(
-        Float, default=0.25
+        Float,
+        default=0.25,
+        nullable=False,
     )
 
     active: Mapped[bool] = mapped_column(
-        Boolean, default=True
+        Boolean,
+        default=True,
+        nullable=False,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
     category: Mapped["Category"] = relationship(
-        back_populates="questions"
+        back_populates="questions",
     )
 
 
 # ==================================================
-# QUIZZES
+# QUIZ
 # ==================================================
 
 class Quiz(Base):
     __tablename__ = "quizzes"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     title: Mapped[str] = mapped_column(
-        String(200)
+        String(200),
+        nullable=False,
     )
 
     category_id: Mapped[int | None] = mapped_column(
@@ -158,103 +208,144 @@ class Quiz(Base):
     )
 
     question_count: Mapped[int] = mapped_column(
-        Integer, default=0
+        Integer,
+        default=10,
+        nullable=False,
     )
 
     duration_minutes: Mapped[int] = mapped_column(
-        Integer, default=20
+        Integer,
+        default=10,
+        nullable=False,
     )
 
     marks_per_correct: Mapped[float] = mapped_column(
-        Float, default=1.0
+        Float,
+        default=1.0,
+        nullable=False,
     )
 
     negative_marks: Mapped[float] = mapped_column(
-        Float, default=0.25
+        Float,
+        default=0.25,
+        nullable=False,
     )
 
     shuffle_questions: Mapped[bool] = mapped_column(
-        Boolean, default=True
+        Boolean,
+        default=True,
+        nullable=False,
     )
 
     shuffle_options: Mapped[bool] = mapped_column(
-        Boolean, default=True
+        Boolean,
+        default=True,
+        nullable=False,
     )
 
     status: Mapped[str] = mapped_column(
-        String(20), default="draft", index=True
+        String(20),
+        default="draft",
+        nullable=False,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
 
 # ==================================================
-# STUDENT ATTEMPTS
+# STUDENT ATTEMPT
 # ==================================================
 
 class StudentAttempt(Base):
     __tablename__ = "student_attempts"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     quiz_id: Mapped[int] = mapped_column(
-        ForeignKey("quizzes.id"), index=True
+        ForeignKey("quizzes.id"),
+        nullable=False,
+        index=True,
     )
 
     student_telegram_id: Mapped[str] = mapped_column(
-        String(50), index=True
+        String(50),
+        nullable=False,
+        index=True,
     )
 
     score: Mapped[float] = mapped_column(
-        Float, default=0.0
+        Float,
+        default=0.0,
+        nullable=False,
     )
 
     correct_count: Mapped[int] = mapped_column(
-        Integer, default=0
+        Integer,
+        default=0,
+        nullable=False,
     )
 
     wrong_count: Mapped[int] = mapped_column(
-        Integer, default=0
+        Integer,
+        default=0,
+        nullable=False,
     )
 
     unanswered_count: Mapped[int] = mapped_column(
-        Integer, default=0
+        Integer,
+        default=0,
+        nullable=False,
     )
 
-    submitted_at: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
 
 # ==================================================
-# APPROVED TELEGRAM GROUPS
+# APPROVED GROUPS
 # ==================================================
 
 class ApprovedGroup(Base):
     __tablename__ = "approved_groups"
 
     group_id: Mapped[str] = mapped_column(
-        String(50), primary_key=True
+        String(50),
+        primary_key=True,
     )
 
     group_title: Mapped[str] = mapped_column(
-        String(200), default=""
+        String(200),
+        default="",
+        nullable=False,
     )
 
     approved_by: Mapped[str] = mapped_column(
-        String(50)
+        String(50),
+        default="",
+        nullable=False,
     )
 
     approved_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
     active: Mapped[bool] = mapped_column(
-        Boolean, default=True, index=True
+        Boolean,
+        default=True,
+        nullable=False,
     )
 
 
@@ -266,63 +357,75 @@ class GroupAccessRequest(Base):
     __tablename__ = "group_access_requests"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     group_id: Mapped[str] = mapped_column(
-        String(50), index=True
+        String(50),
+        nullable=False,
+        index=True,
     )
 
     group_title: Mapped[str] = mapped_column(
-        String(200), default=""
+        String(200),
+        default="",
+        nullable=False,
     )
 
     requested_by: Mapped[str] = mapped_column(
-        String(50)
+        String(50),
+        nullable=False,
     )
 
     requester_username: Mapped[str] = mapped_column(
-        String(100), default=""
+        String(100),
+        default="",
+        nullable=False,
     )
 
     status: Mapped[str] = mapped_column(
-        String(20), default="pending", index=True
+        String(20),
+        default="pending",
+        nullable=False,
     )
 
     requested_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
     )
 
     reviewed_by: Mapped[str | None] = mapped_column(
-        String(50), nullable=True
+        String(50),
+        nullable=True,
     )
 
     reviewed_at: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True
+        DateTime,
+        nullable=True,
     )
 
 
 # ==================================================
-# CUSTOM BOT NAME PER CHAT
+# CUSTOM BOT DISPLAY NAME PER CHAT
 # ==================================================
 
 class ChatSetting(Base):
     __tablename__ = "chat_settings"
 
-    # Unique Telegram chat ID
     chat_id: Mapped[str] = mapped_column(
         String(50),
         primary_key=True,
     )
 
-    # Name displayed in this chat's bot messages
     display_name: Mapped[str] = mapped_column(
         String(100),
         default="0xGREY",
         nullable=False,
     )
 
-    # Owner Telegram ID who last changed the name
     updated_by: Mapped[str] = mapped_column(
         String(50),
         default="",
@@ -338,20 +441,20 @@ class ChatSetting(Base):
 
 
 # ==================================================
-# DATABASE INITIALIZATION
+# INITIALIZE DATABASE
 # ==================================================
 
 def init_db():
-    """
-    Create missing database tables.
+    """Create any missing tables without deleting existing data."""
 
-    Existing tables and their records are preserved.
-    """
     Base.metadata.create_all(bind=engine)
 
 
+# ==================================================
+# DATABASE SESSION HELPER
+# ==================================================
+
 def get_db():
-    """Provide a database session."""
     db = SessionLocal()
 
     try:
@@ -360,10 +463,13 @@ def get_db():
         db.close()
 
 
+# ==================================================
+# DIRECT EXECUTION
+# ==================================================
+
 if __name__ == "__main__":
     init_db()
 
-    print("0xGREY database initialized successfully.")
-    print("Question bank and quiz tables are available.")
-    print("Group approval tables are available.")
-    print("Custom chat-name settings are available.")
+    print("✅ Database initialized successfully.")
+    print("✅ Existing database tables are preserved.")
+    print("✅ Custom chat-name settings are available.")
