@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime
 
 from sqlalchemy import (
@@ -10,6 +11,8 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -19,10 +22,11 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# ==================================================
-# DATABASE CONFIGURATION
-# ==================================================
+logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -34,10 +38,12 @@ engine_options = {}
 if DATABASE_URL.startswith("sqlite"):
     engine_options["connect_args"] = {
         "check_same_thread": False,
+        "timeout": 30,
     }
 
 engine = create_engine(
     DATABASE_URL,
+    pool_pre_ping=True,
     **engine_options,
 )
 
@@ -45,20 +51,21 @@ SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
     bind=engine,
+    expire_on_commit=False,
 )
 
 
-# ==================================================
+# ============================================================
 # BASE MODEL
-# ==================================================
+# ============================================================
 
 class Base(DeclarativeBase):
     pass
 
 
-# ==================================================
+# ============================================================
 # CATEGORY
-# ==================================================
+# ============================================================
 
 class Category(Base):
     __tablename__ = "categories"
@@ -94,9 +101,9 @@ class Category(Base):
     )
 
 
-# ==================================================
+# ============================================================
 # QUESTION
-# ==================================================
+# ============================================================
 
 class Question(Base):
     __tablename__ = "questions"
@@ -184,9 +191,9 @@ class Question(Base):
     )
 
 
-# ==================================================
+# ============================================================
 # QUIZ
-# ==================================================
+# ============================================================
 
 class Quiz(Base):
     __tablename__ = "quizzes"
@@ -205,6 +212,7 @@ class Quiz(Base):
     category_id: Mapped[int | None] = mapped_column(
         ForeignKey("categories.id"),
         nullable=True,
+        index=True,
     )
 
     question_count: Mapped[int] = mapped_column(
@@ -247,6 +255,7 @@ class Quiz(Base):
         String(20),
         default="draft",
         nullable=False,
+        index=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -256,9 +265,9 @@ class Quiz(Base):
     )
 
 
-# ==================================================
+# ============================================================
 # STUDENT ATTEMPT
-# ==================================================
+# ============================================================
 
 class StudentAttempt(Base):
     __tablename__ = "student_attempts"
@@ -279,6 +288,27 @@ class StudentAttempt(Base):
         String(50),
         nullable=False,
         index=True,
+    )
+
+    # Display name captured at submission time.
+    student_name: Mapped[str] = mapped_column(
+        String(200),
+        default="Student",
+        nullable=False,
+    )
+
+    # Telegram group/chat ID. Empty means no group recorded.
+    group_id: Mapped[str] = mapped_column(
+        String(50),
+        default="",
+        nullable=False,
+        index=True,
+    )
+
+    group_title: Mapped[str] = mapped_column(
+        String(200),
+        default="",
+        nullable=False,
     )
 
     score: Mapped[float] = mapped_column(
@@ -305,16 +335,78 @@ class StudentAttempt(Base):
         nullable=False,
     )
 
+    # Timing information.
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         nullable=False,
+        index=True,
+    )
+
+    duration_seconds: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+    )
+
+    # Calculated results.
+    accuracy_percent: Mapped[float] = mapped_column(
+        Float,
+        default=0.0,
+        nullable=False,
+    )
+
+    score_percent: Mapped[float] = mapped_column(
+        Float,
+        default=0.0,
+        nullable=False,
+    )
+
+    group_percentile: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    overall_percentile: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+    )
+
+    # Personalised feedback generated after scoring.
+    performance_tagline: Mapped[str] = mapped_column(
+        String(300),
+        default="Keep practising and improving.",
+        nullable=False,
+    )
+
+    performance_insight: Mapped[str] = mapped_column(
+        Text,
+        default="",
+        nullable=False,
+    )
+
+    motivational_quote: Mapped[str] = mapped_column(
+        String(500),
+        default="Consistency creates progress.",
+        nullable=False,
+    )
+
+    # Indicates whether this attempt has been published.
+    leaderboard_published: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
     )
 
 
-# ==================================================
+# ============================================================
 # APPROVED GROUPS
-# ==================================================
+# ============================================================
 
 class ApprovedGroup(Base):
     __tablename__ = "approved_groups"
@@ -349,9 +441,9 @@ class ApprovedGroup(Base):
     )
 
 
-# ==================================================
+# ============================================================
 # GROUP ACCESS REQUESTS
-# ==================================================
+# ============================================================
 
 class GroupAccessRequest(Base):
     __tablename__ = "group_access_requests"
@@ -389,6 +481,7 @@ class GroupAccessRequest(Base):
         String(20),
         default="pending",
         nullable=False,
+        index=True,
     )
 
     requested_at: Mapped[datetime] = mapped_column(
@@ -408,9 +501,9 @@ class GroupAccessRequest(Base):
     )
 
 
-# ==================================================
+# ============================================================
 # CUSTOM BOT DISPLAY NAME PER CHAT
-# ==================================================
+# ============================================================
 
 class ChatSetting(Base):
     __tablename__ = "chat_settings"
@@ -440,19 +533,111 @@ class ChatSetting(Base):
     )
 
 
-# ==================================================
+# ============================================================
+# DATABASE MIGRATION
+# ============================================================
+
+def migrate_existing_database():
+    """
+    Add new StudentAttempt columns to an existing database.
+
+    Existing rows and tables are preserved. New columns use
+    nullable or server-default-compatible definitions so old
+    records remain readable.
+    """
+
+    inspector = inspect(engine)
+
+    if "student_attempts" not in inspector.get_table_names():
+        return
+
+    existing_columns = {
+        column["name"]
+        for column in inspector.get_columns("student_attempts")
+    }
+
+    # The new columns and their SQL types.
+    #
+    # Use SQL defaults for populated existing tables. This avoids
+    # failures when adding NOT NULL columns to existing records.
+    new_columns = {
+        "student_name": (
+            "VARCHAR(200) NOT NULL DEFAULT 'Student'"
+        ),
+        "group_id": (
+            "VARCHAR(50) NOT NULL DEFAULT ''"
+        ),
+        "group_title": (
+            "VARCHAR(200) NOT NULL DEFAULT ''"
+        ),
+        "started_at": "TIMESTAMP NULL",
+        "duration_seconds": (
+            "INTEGER NOT NULL DEFAULT 0"
+        ),
+        "accuracy_percent": (
+            "FLOAT NOT NULL DEFAULT 0"
+        ),
+        "score_percent": (
+            "FLOAT NOT NULL DEFAULT 0"
+        ),
+        "group_percentile": "FLOAT NULL",
+        "overall_percentile": "FLOAT NULL",
+        "performance_tagline": (
+            "VARCHAR(300) NOT NULL "
+            "DEFAULT 'Keep practising and improving.'"
+        ),
+        "performance_insight": (
+            "TEXT NOT NULL DEFAULT ''"
+        ),
+        "motivational_quote": (
+            "VARCHAR(500) NOT NULL "
+            "DEFAULT 'Consistency creates progress.'"
+        ),
+        "leaderboard_published": (
+            "BOOLEAN NOT NULL DEFAULT FALSE"
+        ),
+    }
+
+    with engine.begin() as connection:
+        for column_name, column_definition in new_columns.items():
+            if column_name in existing_columns:
+                continue
+
+            statement = (
+                f"ALTER TABLE student_attempts "
+                f"ADD COLUMN {column_name} {column_definition}"
+            )
+
+            logger.info(
+                "Adding database column: %s",
+                column_name,
+            )
+
+            connection.execute(text(statement))
+
+    logger.info("Database migration completed.")
+
+
+# ============================================================
 # INITIALIZE DATABASE
-# ==================================================
+# ============================================================
 
 def init_db():
-    """Create any missing tables without deleting existing data."""
+    """
+    Create missing tables and add missing attempt columns.
+
+    This does not delete existing records.
+    """
 
     Base.metadata.create_all(bind=engine)
+    migrate_existing_database()
+
+    logger.info("0xGREY database initialized.")
 
 
-# ==================================================
+# ============================================================
 # DATABASE SESSION HELPER
-# ==================================================
+# ============================================================
 
 def get_db():
     db = SessionLocal()
@@ -463,13 +648,15 @@ def get_db():
         db.close()
 
 
-# ==================================================
+# ============================================================
 # DIRECT EXECUTION
-# ==================================================
+# ============================================================
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
     init_db()
 
-    print("✅ Database initialized successfully.")
-    print("✅ Existing database tables are preserved.")
-    print("✅ Custom chat-name settings are available.")
+    print("0xGREY database initialized successfully.")
+    print("Existing tables and records are preserved.")
+    print("Student attempt analytics fields are available.")
