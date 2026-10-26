@@ -1,7 +1,9 @@
 import os
-import logging
+import json
+import time
 import random
 import asyncio
+import logging
 from datetime import datetime
 
 from telegram import Update
@@ -10,11 +12,16 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    PollAnswerHandler,
 )
+
+from sqlalchemy import func
 
 from database import (
     Category,
     Question,
+    Quiz,
+    StudentAttempt,
     ApprovedGroup,
     GroupAccessRequest,
     ChatSetting,
@@ -22,17 +29,16 @@ from database import (
     init_db,
 )
 
-
-# ==================================================
+# ============================================================
 # CONFIGURATION
-# ==================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("0xGREY")
 
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
@@ -43,10 +49,34 @@ OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "").strip()
 
 DEFAULT_DISPLAY_NAME = "0xGREY"
 
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# ==================================================
-# OWNER PERMISSION
-# ==================================================
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash",
+)
+
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile",
+)
+
+MOTIVATIONAL_QUOTES = [
+    "Consistency creates progress.",
+    "Every attempt is an opportunity to improve.",
+    "Discipline turns preparation into performance.",
+    "A mistake understood today becomes strength tomorrow.",
+    "Focus on improvement, not perfection.",
+    "Strong preparation is built one question at a time.",
+    "Keep learning. Keep practising. Keep progressing.",
+]
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def is_owner(update: Update) -> bool:
     user = update.effective_user
@@ -59,23 +89,20 @@ def is_owner(update: Update) -> bool:
 
 
 async def owner_required(update: Update) -> bool:
-    if not is_owner(update):
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "⛔ This command is restricted to the bot owner."
-            )
-        return False
+    if is_owner(update):
+        return True
 
-    return True
+    message = update.effective_message
 
+    if message:
+        await message.reply_text(
+            "⛔ This command is restricted to the bot owner."
+        )
 
-# ==================================================
-# CUSTOM CHAT DISPLAY NAME
-# ==================================================
+    return False
+
 
 def get_chat_display_name(chat_id: int) -> str:
-    """Return the saved display name or the default name."""
-
     with SessionLocal() as db:
         setting = (
             db.query(ChatSetting)
@@ -89,163 +116,15 @@ def get_chat_display_name(chat_id: int) -> str:
     return DEFAULT_DISPLAY_NAME
 
 
-def get_display_name_safely(chat_id: int) -> str:
-    """Avoid breaking ordinary bot replies if settings cannot be read."""
-
+def safe_display_name(chat_id: int) -> str:
     try:
         return get_chat_display_name(chat_id)
     except Exception:
-        logger.exception(
-            "Could not retrieve display name for chat %s",
-            chat_id,
-        )
+        logger.exception("Could not load chat display name")
         return DEFAULT_DISPLAY_NAME
 
 
-async def set_chat_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Set the display name for the current chat."""
-
-    if not await owner_required(update):
-        return
-
-    message = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if message is None or chat is None or user is None:
-        return
-
-    display_name = " ".join(context.args).strip()
-
-    if not display_name:
-        await message.reply_text(
-            "Usage:\n"
-            "/set_chat_name PH Banking Expert\n\n"
-            "Examples:\n"
-            "/set_chat_name PH Banking Expert\n"
-            "/set_chat_name PH English Mentor\n"
-            "/set_chat_name 0xGREY"
-        )
-        return
-
-    if len(display_name) > 100:
-        await message.reply_text(
-            "❌ The display name must be 100 characters or fewer."
-        )
-        return
-
-    try:
-        with SessionLocal() as db:
-            setting = (
-                db.query(ChatSetting)
-                .filter_by(chat_id=str(chat.id))
-                .first()
-            )
-
-            if setting:
-                setting.display_name = display_name
-                setting.updated_by = str(user.id)
-            else:
-                db.add(
-                    ChatSetting(
-                        chat_id=str(chat.id),
-                        display_name=display_name,
-                        updated_by=str(user.id),
-                    )
-                )
-
-            db.commit()
-
-        await message.reply_text(
-            "✅ CHAT DISPLAY NAME UPDATED\n\n"
-            f"🏷️ Name: {display_name}\n"
-            f"🆔 Chat ID: {chat.id}\n\n"
-            "Supported bot messages will use this name."
-        )
-
-    except Exception:
-        logger.exception("Failed to update chat display name")
-
-        await message.reply_text(
-            "❌ Could not save the display name. "
-            "Check the hosting logs."
-        )
-
-
-async def get_chat_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Display the saved name for the current chat."""
-
-    if not await owner_required(update):
-        return
-
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if chat is None or message is None:
-        return
-
-    display_name = get_display_name_safely(chat.id)
-
-    await message.reply_text(
-        "🏷️ CHAT DISPLAY NAME\n\n"
-        f"Name: {display_name}\n"
-        f"Chat ID: {chat.id}"
-    )
-
-
-async def reset_chat_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Remove the custom name and restore the default."""
-
-    if not await owner_required(update):
-        return
-
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if chat is None or message is None:
-        return
-
-    try:
-        with SessionLocal() as db:
-            setting = (
-                db.query(ChatSetting)
-                .filter_by(chat_id=str(chat.id))
-                .first()
-            )
-
-            if setting:
-                db.delete(setting)
-                db.commit()
-
-        await message.reply_text(
-            "✅ Chat display name reset.\n"
-            f"Default name: {DEFAULT_DISPLAY_NAME}"
-        )
-
-    except Exception:
-        logger.exception("Failed to reset chat display name")
-
-        await message.reply_text(
-            "❌ Could not reset the display name."
-        )
-
-
-# ==================================================
-# GROUP ACCESS HELPERS
-# ==================================================
-
 def get_approved_group(group_id: str):
-    """Return an active approved group, or None."""
-
     with SessionLocal() as db:
         return (
             db.query(ApprovedGroup)
@@ -257,61 +136,31 @@ def get_approved_group(group_id: str):
         )
 
 
-async def check_publish_permission(
-    update: Update,
-) -> bool:
-    """Check whether the current group is approved."""
-
-    chat = update.effective_chat
-
-    if chat is None:
-        return False
-
-    if chat.type == "private":
-        return True
-
-    approved = get_approved_group(str(chat.id))
-
-    if approved is None:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "⛔ This group is not approved to receive quizzes.\n\n"
-                "A group administrator can request access using:\n"
-                "/request_access"
-            )
-        return False
-
-    return True
-
-
-async def check_publish_permission_for_target(
+async def can_publish_to(
     update: Update,
     target_chat_id: int,
 ) -> bool:
-    """Ensure a group target is actively approved."""
-
-    # Positive Telegram chat IDs represent private chats.
-    # Owner-only quiz publishing can be tested in private chat.
     if target_chat_id > 0:
         return True
 
-    approved = get_approved_group(str(target_chat_id))
+    if get_approved_group(str(target_chat_id)):
+        return True
 
-    if approved is None:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "⛔ Publishing blocked.\n\n"
-                "The target group is not currently approved.\n"
-                "Use /approved_groups to check approved groups."
-            )
-        return False
+    message = update.effective_message
 
-    return True
+    if message:
+        await message.reply_text(
+            "⛔ Publishing blocked.\n"
+            "This group is not approved.\n"
+            "Use /approved_groups to check access."
+        )
+
+    return False
 
 
-# ==================================================
-# START
-# ==================================================
+# ============================================================
+# START AND HELP
+# ============================================================
 
 async def start(
     update: Update,
@@ -323,69 +172,60 @@ async def start(
     if chat is None or message is None:
         return
 
-    display_name = get_display_name_safely(chat.id)
+    name = safe_display_name(chat.id)
 
     await message.reply_text(
-        f"🎓 Welcome to {display_name}!\n\n"
-        "Premium Mock Test Platform\n\n"
-        "📚 Question Bank\n"
-        "📝 Telegram Quiz Polls\n"
-        "🔀 Shuffled Answer Options\n"
-        "🔐 Approved Group Publishing\n"
-        "📊 Quiz Publishing\n"
-        "🏆 Leaderboards — planned\n\n"
-        "Use /help to see available commands."
+        f"🎓 Welcome to {name}!\n\n"
+        "🏆 PREMIUM MOCK TEST PLATFORM\n\n"
+        "📚 Question bank\n"
+        "📝 Interactive Telegram quiz polls\n"
+        "🔀 Shuffled options\n"
+        "🔐 Owner-approved group publishing\n"
+        "📊 Automatic scoring\n"
+        "🏆 Premium leaderboard\n"
+        "💡 Personalised performance feedback\n\n"
+        "Use /help to see commands."
     )
 
-
-# ==================================================
-# HELP
-# ==================================================
 
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    chat = update.effective_chat
     message = update.effective_message
 
-    if chat is None or message is None:
+    if not message:
         return
 
-    display_name = get_display_name_safely(chat.id)
-
     await message.reply_text(
-        f"📌 {display_name.upper()} COMMANDS\n\n"
-
+        "📚 0xGREY COMMANDS\n\n"
         "GENERAL\n"
-        "/start — Start the bot\n"
-        "/help — Show commands\n"
-        "/status — Bot status\n\n"
-
-        "CUSTOM CHAT DISPLAY NAME — OWNER ONLY\n"
-        "/set_chat_name NAME — Set this chat's name\n"
-        "/get_chat_name — Show this chat's name\n"
-        "/reset_chat_name — Restore default name\n\n"
-
+        "/start\n"
+        "/help\n"
+        "/status\n\n"
         "QUESTION BANK — OWNER ONLY\n"
         "/addcategory English\n"
         "/categories\n"
         "/addquestion English\n"
         "/questioncount\n\n"
-
-        "QUIZ POLLS — OWNER ONLY\n"
-        "/testpoll — Send a demo poll\n"
-        "/publishquiz English 5\n"
-        "/publishquiz Banking Awareness 10\n"
-        "/publishquiz_to GROUP_ID COUNT CATEGORY\n\n"
-
+        "QUIZ PUBLISHING — OWNER ONLY\n"
+        "/testpoll\n"
+        "/publishquiz English 10\n"
+        "/publishquiz_to GROUP_ID 10 English\n\n"
+        "QUIZ RESULTS — OWNER ONLY\n"
+        "/activequizzes\n"
+        "/finalizequiz QUIZ_ID\n"
+        "/leaderboard QUIZ_ID\n\n"
         "GROUP ACCESS\n"
-        "/request_access — Request group approval\n"
-        "/pending_groups — View pending requests (owner)\n"
-        "/approve_group GROUP_ID — Approve a group (owner)\n"
-        "/revoke_group GROUP_ID — Revoke a group (owner)\n"
-        "/approved_groups — List approved groups (owner)\n\n"
-
+        "/request_access\n"
+        "/pending_groups\n"
+        "/approve_group GROUP_ID\n"
+        "/revoke_group GROUP_ID\n"
+        "/approved_groups\n\n"
+        "CHAT NAME — OWNER ONLY\n"
+        "/set_chat_name NAME\n"
+        "/get_chat_name\n"
+        "/reset_chat_name\n\n"
         "QUESTION FORMAT\n"
         "/addquestion English\n"
         "Question: What is 2 + 2?\n"
@@ -399,36 +239,120 @@ async def help_command(
     )
 
 
-# ==================================================
-# STATUS
-# ==================================================
-
 async def status(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    chat = update.effective_chat
     message = update.effective_message
 
-    if chat is None or message is None:
+    if not message:
         return
 
-    display_name = get_display_name_safely(chat.id)
+    await message.reply_text(
+        "✅ 0xGREY is running.\n"
+        f"Owner access: {'Yes' if is_owner(update) else 'No'}"
+    )
 
-    if is_owner(update):
-        response = (
-            f"✅ {display_name} is running.\n"
-            "👑 Owner access recognised."
+
+# ============================================================
+# CHAT DISPLAY NAME
+# ============================================================
+
+async def set_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+
+    if not chat or not user or not message:
+        return
+
+    name = " ".join(context.args).strip()
+
+    if not name or len(name) > 100:
+        await message.reply_text(
+            "Usage: /set_chat_name 0xGREY"
         )
-    else:
-        response = f"✅ {display_name} is running."
+        return
 
-    await message.reply_text(response)
+    with SessionLocal() as db:
+        setting = (
+            db.query(ChatSetting)
+            .filter_by(chat_id=str(chat.id))
+            .first()
+        )
+
+        if setting:
+            setting.display_name = name
+            setting.updated_by = str(user.id)
+        else:
+            db.add(
+                ChatSetting(
+                    chat_id=str(chat.id),
+                    display_name=name,
+                    updated_by=str(user.id),
+                )
+            )
+
+        db.commit()
+
+    await message.reply_text(
+        f"✅ Display name updated to {name}."
+    )
 
 
-# ==================================================
-# REQUEST GROUP ACCESS
-# ==================================================
+async def get_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+
+    if chat:
+        await update.effective_message.reply_text(
+            f"Display name: {safe_display_name(chat.id)}\n"
+            f"Chat ID: {chat.id}"
+        )
+
+
+async def reset_chat_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    with SessionLocal() as db:
+        setting = (
+            db.query(ChatSetting)
+            .filter_by(chat_id=str(chat.id))
+            .first()
+        )
+
+        if setting:
+            db.delete(setting)
+            db.commit()
+
+    await update.effective_message.reply_text(
+        f"✅ Default name restored: {DEFAULT_DISPLAY_NAME}"
+    )
+
+
+# ============================================================
+# GROUP ACCESS REQUESTS
+# ============================================================
 
 async def request_access(
     update: Update,
@@ -438,13 +362,12 @@ async def request_access(
     user = update.effective_user
     message = update.effective_message
 
-    if chat is None or user is None or message is None:
+    if not chat or not user or not message:
         return
 
     if chat.type not in {"group", "supergroup"}:
         await message.reply_text(
-            "ℹ️ Run /request_access inside the Telegram group "
-            "that wants to receive quizzes."
+            "Run /request_access inside the Telegram group."
         )
         return
 
@@ -456,8 +379,7 @@ async def request_access(
 
         if member.status not in {"administrator", "creator"}:
             await message.reply_text(
-                "⛔ Only a group administrator or group creator "
-                "can request access."
+                "⛔ Only a group administrator can request access."
             )
             return
 
@@ -465,117 +387,74 @@ async def request_access(
         logger.exception("Could not verify group administrator")
 
         await message.reply_text(
-            "❌ I could not verify your administrator status. "
-            "Make sure the bot is in the group and try again."
+            "Could not verify your administrator status."
         )
         return
 
-    try:
-        with SessionLocal() as db:
-            approved = (
-                db.query(ApprovedGroup)
-                .filter(
-                    ApprovedGroup.group_id == str(chat.id),
-                    ApprovedGroup.active.is_(True),
-                )
-                .first()
+    with SessionLocal() as db:
+        approved = (
+            db.query(ApprovedGroup)
+            .filter(
+                ApprovedGroup.group_id == str(chat.id),
+                ApprovedGroup.active.is_(True),
             )
-
-            if approved:
-                await message.reply_text(
-                    "✅ This group is already approved to receive quizzes."
-                )
-                return
-
-            pending = (
-                db.query(GroupAccessRequest)
-                .filter(
-                    GroupAccessRequest.group_id == str(chat.id),
-                    GroupAccessRequest.status == "pending",
-                )
-                .first()
-            )
-
-            if pending:
-                await message.reply_text(
-                    "⏳ This group already has a pending access request."
-                )
-                return
-
-            previous = (
-                db.query(GroupAccessRequest)
-                .filter(
-                    GroupAccessRequest.group_id == str(chat.id)
-                )
-                .order_by(GroupAccessRequest.id.desc())
-                .first()
-            )
-
-            if previous:
-                previous.group_title = chat.title or ""
-                previous.requested_by = str(user.id)
-                previous.requester_username = user.username or ""
-                previous.status = "pending"
-                previous.requested_at = datetime.utcnow()
-                previous.reviewed_by = None
-                previous.reviewed_at = None
-            else:
-                db.add(
-                    GroupAccessRequest(
-                        group_id=str(chat.id),
-                        group_title=chat.title or "",
-                        requested_by=str(user.id),
-                        requester_username=user.username or "",
-                        status="pending",
-                    )
-                )
-
-            db.commit()
-
-        await message.reply_text(
-            "📨 GROUP ACCESS REQUEST SUBMITTED\n\n"
-            f"📚 Group: {chat.title or 'Unnamed group'}\n"
-            f"🆔 Group ID: {chat.id}\n\n"
-            "The bot owner must review this request.\n"
-            "Approval is not automatic."
+            .first()
         )
 
-        if OWNER_ID:
-            try:
-                username_text = (
-                    f"Username: @{user.username}"
-                    if user.username
-                    else "Username: unavailable"
-                )
+        if approved:
+            await message.reply_text(
+                "✅ This group is already approved."
+            )
+            return
 
-                await context.bot.send_message(
-                    chat_id=int(OWNER_ID),
-                    text=(
-                        "📨 NEW GROUP ACCESS REQUEST\n\n"
-                        f"📚 Group: {chat.title or 'Unnamed group'}\n"
-                        f"🆔 Group ID: {chat.id}\n"
-                        f"👤 Requested by: {user.id}\n"
-                        f"{username_text}"
-                    ),
-                )
-
-            except TelegramError:
-                logger.info(
-                    "Could not DM owner about group access request."
-                )
-
-    except Exception:
-        logger.exception("Failed to record group access request")
-
-        await message.reply_text(
-            "❌ Could not submit the request. "
-            "Check the hosting logs."
+        request = (
+            db.query(GroupAccessRequest)
+            .filter(
+                GroupAccessRequest.group_id == str(chat.id),
+                GroupAccessRequest.status == "pending",
+            )
+            .first()
         )
 
+        if request:
+            await message.reply_text(
+                "⏳ An access request is already pending."
+            )
+            return
 
-# ==================================================
-# VIEW PENDING GROUP REQUESTS
-# ==================================================
+        db.add(
+            GroupAccessRequest(
+                group_id=str(chat.id),
+                group_title=chat.title or "",
+                requested_by=str(user.id),
+                requester_username=user.username or "",
+                status="pending",
+            )
+        )
+
+        db.commit()
+
+    await message.reply_text(
+        "📨 ACCESS REQUEST SUBMITTED\n\n"
+        f"Group: {chat.title or 'Unnamed'}\n"
+        f"ID: {chat.id}\n\n"
+        "The owner must approve this group."
+    )
+
+    if OWNER_ID:
+        try:
+            await context.bot.send_message(
+                chat_id=int(OWNER_ID),
+                text=(
+                    "📨 NEW GROUP REQUEST\n\n"
+                    f"Group: {chat.title or 'Unnamed'}\n"
+                    f"Group ID: {chat.id}\n"
+                    f"Requested by: {user.id}\n"
+                ),
+            )
+        except TelegramError:
+            logger.exception("Could not notify owner")
+
 
 async def pending_groups(
     update: Update,
@@ -584,43 +463,29 @@ async def pending_groups(
     if not await owner_required(update):
         return
 
-    try:
-        with SessionLocal() as db:
-            requests = (
-                db.query(GroupAccessRequest)
-                .filter(GroupAccessRequest.status == "pending")
-                .order_by(GroupAccessRequest.requested_at.asc())
-                .all()
-            )
-
-            if not requests:
-                response = "📭 There are no pending group requests."
-            else:
-                lines = ["📨 PENDING GROUP REQUESTS\n"]
-
-                for request in requests:
-                    lines.append(
-                        f"📚 {request.group_title or 'Unnamed group'}\n"
-                        f"🆔 ID: {request.group_id}\n"
-                        f"👤 Requested by: {request.requested_by}\n"
-                        f"Use: /approve_group {request.group_id}\n"
-                    )
-
-                response = "\n".join(lines)
-
-        await update.effective_message.reply_text(response)
-
-    except Exception:
-        logger.exception("Failed to list pending group requests")
-
-        await update.effective_message.reply_text(
-            "❌ Could not retrieve pending requests."
+    with SessionLocal() as db:
+        requests = (
+            db.query(GroupAccessRequest)
+            .filter(GroupAccessRequest.status == "pending")
+            .order_by(GroupAccessRequest.requested_at.asc())
+            .all()
         )
 
+        lines = ["📨 PENDING GROUP REQUESTS\n"]
 
-# ==================================================
-# APPROVE GROUP
-# ==================================================
+        for request in requests:
+            lines.append(
+                f"{request.group_title or 'Unnamed'}\n"
+                f"ID: {request.group_id}\n"
+                f"Use /approve_group {request.group_id}\n"
+            )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+        if requests
+        else "No pending group requests."
+    )
+
 
 async def approve_group(
     update: Update,
@@ -631,104 +496,57 @@ async def approve_group(
 
     if len(context.args) != 1:
         await update.effective_message.reply_text(
-            "Usage:\n/approve_group GROUP_ID\n\n"
-            "Use /pending_groups to see group IDs."
+            "Usage: /approve_group GROUP_ID"
         )
         return
 
-    group_id = context.args[0].strip()
+    group_id = context.args[0]
 
-    try:
-        with SessionLocal() as db:
-            request = (
-                db.query(GroupAccessRequest)
-                .filter(
-                    GroupAccessRequest.group_id == group_id,
-                    GroupAccessRequest.status == "pending",
-                )
-                .order_by(GroupAccessRequest.id.desc())
-                .first()
+    with SessionLocal() as db:
+        request = (
+            db.query(GroupAccessRequest)
+            .filter(
+                GroupAccessRequest.group_id == group_id,
+                GroupAccessRequest.status == "pending",
             )
-
-            existing = (
-                db.query(ApprovedGroup)
-                .filter(ApprovedGroup.group_id == group_id)
-                .first()
-            )
-
-            if existing and existing.active:
-                await update.effective_message.reply_text(
-                    "✅ This group is already approved."
-                )
-                return
-
-            group_title = (
-                request.group_title
-                if request
-                else (
-                    existing.group_title
-                    if existing
-                    else ""
-                )
-            )
-
-            if existing:
-                existing.group_title = group_title
-                existing.approved_by = str(update.effective_user.id)
-                existing.approved_at = datetime.utcnow()
-                existing.active = True
-            else:
-                db.add(
-                    ApprovedGroup(
-                        group_id=group_id,
-                        group_title=group_title,
-                        approved_by=str(update.effective_user.id),
-                        approved_at=datetime.utcnow(),
-                        active=True,
-                    )
-                )
-
-            if request:
-                request.status = "approved"
-                request.reviewed_by = str(update.effective_user.id)
-                request.reviewed_at = datetime.utcnow()
-
-            db.commit()
-
-        await update.effective_message.reply_text(
-            "✅ GROUP APPROVED\n\n"
-            f"🆔 Group ID: {group_id}\n"
-            f"📚 Group: {group_title or 'Name unavailable'}\n\n"
-            "This group can now receive quizzes."
+            .order_by(GroupAccessRequest.id.desc())
+            .first()
         )
 
-        try:
-            target_display_name = get_display_name_safely(int(group_id))
-
-            await context.bot.send_message(
-                chat_id=int(group_id),
-                text=(
-                    f"✅ {target_display_name} GROUP ACCESS APPROVED\n\n"
-                    "This group is now authorised to receive quizzes."
-                ),
-            )
-
-        except (TelegramError, ValueError):
-            logger.info(
-                "Group approved, but notification could not be delivered."
-            )
-
-    except Exception:
-        logger.exception("Failed to approve group")
-
-        await update.effective_message.reply_text(
-            "❌ Could not approve the group. Check the hosting logs."
+        group = (
+            db.query(ApprovedGroup)
+            .filter(ApprovedGroup.group_id == group_id)
+            .first()
         )
 
+        title = request.group_title if request else ""
 
-# ==================================================
-# REVOKE GROUP ACCESS
-# ==================================================
+        if group:
+            group.active = True
+            group.group_title = title or group.group_title
+            group.approved_by = str(update.effective_user.id)
+            group.approved_at = datetime.utcnow()
+        else:
+            db.add(
+                ApprovedGroup(
+                    group_id=group_id,
+                    group_title=title,
+                    approved_by=str(update.effective_user.id),
+                    active=True,
+                )
+            )
+
+        if request:
+            request.status = "approved"
+            request.reviewed_by = str(update.effective_user.id)
+            request.reviewed_at = datetime.utcnow()
+
+        db.commit()
+
+    await update.effective_message.reply_text(
+        f"✅ Group {group_id} approved."
+    )
+
 
 async def revoke_group(
     update: Update,
@@ -739,61 +557,32 @@ async def revoke_group(
 
     if len(context.args) != 1:
         await update.effective_message.reply_text(
-            "Usage:\n/revoke_group GROUP_ID"
+            "Usage: /revoke_group GROUP_ID"
         )
         return
 
-    group_id = context.args[0].strip()
+    group_id = context.args[0]
 
-    try:
-        with SessionLocal() as db:
-            group = (
-                db.query(ApprovedGroup)
-                .filter(ApprovedGroup.group_id == group_id)
-                .first()
-            )
-
-            if group is None or not group.active:
-                await update.effective_message.reply_text(
-                    "ℹ️ This group is not currently approved."
-                )
-                return
-
-            group.active = False
-
-            (
-                db.query(GroupAccessRequest)
-                .filter(
-                    GroupAccessRequest.group_id == group_id,
-                    GroupAccessRequest.status == "pending",
-                )
-                .update(
-                    {"status": "revoked"},
-                    synchronize_session=False,
-                )
-            )
-
-            group_title = group.group_title
-            db.commit()
-
-        await update.effective_message.reply_text(
-            "🔒 GROUP ACCESS REVOKED\n\n"
-            f"📚 Group: {group_title or 'Unknown'}\n"
-            f"🆔 Group ID: {group_id}\n\n"
-            "This group can no longer receive published quizzes."
+    with SessionLocal() as db:
+        group = (
+            db.query(ApprovedGroup)
+            .filter(ApprovedGroup.group_id == group_id)
+            .first()
         )
 
-    except Exception:
-        logger.exception("Failed to revoke group")
+        if not group:
+            await update.effective_message.reply_text(
+                "Group not found."
+            )
+            return
 
-        await update.effective_message.reply_text(
-            "❌ Could not revoke group access."
-        )
+        group.active = False
+        db.commit()
 
+    await update.effective_message.reply_text(
+        f"🔒 Access revoked for {group_id}."
+    )
 
-# ==================================================
-# LIST APPROVED GROUPS
-# ==================================================
 
 async def approved_groups(
     update: Update,
@@ -802,41 +591,32 @@ async def approved_groups(
     if not await owner_required(update):
         return
 
-    try:
-        with SessionLocal() as db:
-            groups = (
-                db.query(ApprovedGroup)
-                .filter(ApprovedGroup.active.is_(True))
-                .order_by(ApprovedGroup.group_title.asc())
-                .all()
-            )
-
-            if not groups:
-                response = "📭 No groups are currently approved."
-            else:
-                lines = ["🔐 APPROVED GROUPS\n"]
-
-                for group in groups:
-                    lines.append(
-                        f"📚 {group.group_title or 'Unnamed group'}\n"
-                        f"🆔 ID: {group.group_id}\n"
-                    )
-
-                response = "\n".join(lines)
-
-        await update.effective_message.reply_text(response)
-
-    except Exception:
-        logger.exception("Failed to list approved groups")
-
-        await update.effective_message.reply_text(
-            "❌ Could not retrieve approved groups."
+    with SessionLocal() as db:
+        groups = (
+            db.query(ApprovedGroup)
+            .filter(ApprovedGroup.active.is_(True))
+            .order_by(ApprovedGroup.group_title.asc())
+            .all()
         )
 
+        lines = ["🔐 APPROVED GROUPS\n"]
 
-# ==================================================
-# ADD CATEGORY
-# ==================================================
+        for group in groups:
+            lines.append(
+                f"{group.group_title or 'Unnamed'}\n"
+                f"ID: {group.group_id}\n"
+            )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+        if groups
+        else "No approved groups."
+    )
+
+
+# ============================================================
+# QUESTION BANK
+# ============================================================
 
 async def add_category(
     update: Update,
@@ -847,55 +627,31 @@ async def add_category(
 
     name = " ".join(context.args).strip()
 
-    if not name:
+    if not name or len(name) > 100:
         await update.effective_message.reply_text(
             "Usage: /addcategory English"
         )
         return
 
-    if len(name) > 100:
-        await update.effective_message.reply_text(
-            "❌ Category name must be 100 characters or fewer."
-        )
-        return
+    with SessionLocal() as db:
+        categories = db.query(Category).all()
 
-    try:
-        with SessionLocal() as db:
-            categories = db.query(Category).all()
-
-            existing = next(
-                (
-                    category
-                    for category in categories
-                    if category.name.casefold() == name.casefold()
-                ),
-                None,
+        if any(
+            category.name.casefold() == name.casefold()
+            for category in categories
+        ):
+            await update.effective_message.reply_text(
+                "Category already exists."
             )
+            return
 
-            if existing:
-                await update.effective_message.reply_text(
-                    "⚠️ This category already exists."
-                )
-                return
+        db.add(Category(name=name))
+        db.commit()
 
-            db.add(Category(name=name))
-            db.commit()
+    await update.effective_message.reply_text(
+        f"✅ Category created: {name}"
+    )
 
-        await update.effective_message.reply_text(
-            f"✅ Category created!\n📚 Name: {name}"
-        )
-
-    except Exception:
-        logger.exception("Failed to create category")
-
-        await update.effective_message.reply_text(
-            "❌ Could not create the category. Check hosting logs."
-        )
-
-
-# ==================================================
-# LIST CATEGORIES
-# ==================================================
 
 async def list_categories(
     update: Update,
@@ -904,48 +660,31 @@ async def list_categories(
     if not await owner_required(update):
         return
 
-    try:
-        with SessionLocal() as db:
-            categories = (
-                db.query(Category)
-                .order_by(Category.name)
-                .all()
+    with SessionLocal() as db:
+        categories = db.query(Category).order_by(Category.name).all()
+
+        lines = ["📚 QUESTION BANK\n"]
+
+        for category in categories:
+            count = (
+                db.query(Question)
+                .filter(
+                    Question.category_id == category.id,
+                    Question.active.is_(True),
+                )
+                .count()
             )
 
-            if not categories:
-                response = "📚 No categories found."
-            else:
-                lines = ["📚 QUESTION BANK\n"]
+            lines.append(
+                f"{category.name}: {count} active questions"
+            )
 
-                for category in categories:
-                    count = (
-                        db.query(Question)
-                        .filter(
-                            Question.category_id == category.id,
-                            Question.active.is_(True),
-                        )
-                        .count()
-                    )
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+        if categories
+        else "No categories found."
+    )
 
-                    lines.append(
-                        f"• {category.name}: {count} questions"
-                    )
-
-                response = "\n".join(lines)
-
-        await update.effective_message.reply_text(response)
-
-    except Exception:
-        logger.exception("Failed to list categories")
-
-        await update.effective_message.reply_text(
-            "❌ Could not retrieve categories."
-        )
-
-
-# ==================================================
-# ADD QUESTION
-# ==================================================
 
 async def add_question(
     update: Update,
@@ -955,30 +694,26 @@ async def add_question(
         return
 
     message = update.effective_message
-    raw_text = message.text or ""
-    lines = raw_text.splitlines()
+    lines = (message.text or "").splitlines()
 
     if not lines:
         return
 
-    command_parts = lines[0].split(maxsplit=1)
+    first_line = lines[0].split(maxsplit=1)
 
-    if len(command_parts) != 2:
+    if len(first_line) != 2:
         await message.reply_text(
             "Usage:\n"
             "/addquestion English\n"
             "Question: What is 2 + 2?\n"
-            "A: 3\n"
-            "B: 4\n"
-            "C: 5\n"
-            "D: 6\n"
+            "A: 3\nB: 4\nC: 5\nD: 6\n"
             "Correct: B\n"
             "Explanation: Two plus two equals four.\n"
             "Difficulty: Easy"
         )
         return
 
-    category_name = command_parts[1].strip()
+    category_name = first_line[1].strip()
     fields = {}
 
     for line in lines[1:]:
@@ -991,7 +726,7 @@ async def add_question(
     option_b = fields.get("b", "")
     option_c = fields.get("c", "")
     option_d = fields.get("d", "")
-    correct_option = fields.get("correct", "").upper()
+    correct = fields.get("correct", "").upper()
     explanation = fields.get("explanation", "")
     difficulty = fields.get("difficulty", "Moderate").title()
 
@@ -1003,160 +738,21 @@ async def add_question(
         option_d,
     ]):
         await message.reply_text(
-            "❌ The question and all four options are required."
+            "The question and all four options are required."
         )
         return
 
-    if correct_option not in {"A", "B", "C", "D"}:
+    if correct not in {"A", "B", "C", "D"}:
         await message.reply_text(
-            "❌ Correct must be A, B, C, or D."
+            "Correct must be A, B, C, or D."
         )
         return
 
     if difficulty not in {"Easy", "Moderate", "Difficult"}:
         await message.reply_text(
-            "❌ Difficulty must be Easy, Moderate, or Difficult."
+            "Difficulty must be Easy, Moderate, or Difficult."
         )
         return
-
-    try:
-        with SessionLocal() as db:
-            categories = db.query(Category).all()
-
-            category = next(
-                (
-                    item for item in categories
-                    if item.name.casefold() == category_name.casefold()
-                ),
-                None,
-            )
-
-            if category is None:
-                await message.reply_text(
-                    f"❌ Category '{category_name}' not found.\n"
-                    f"Create it first with /addcategory {category_name}"
-                )
-                return
-
-            question = Question(
-                category_id=category.id,
-                question_text=question_text,
-                option_a=option_a,
-                option_b=option_b,
-                option_c=option_c,
-                option_d=option_d,
-                correct_option=correct_option,
-                explanation=explanation,
-                difficulty=difficulty,
-                marks=1.0,
-                negative_marks=0.25,
-                active=True,
-            )
-
-            db.add(question)
-            db.commit()
-            question_id = question.id
-
-        await message.reply_text(
-            "✅ QUESTION SAVED\n\n"
-            f"🆔 ID: {question_id}\n"
-            f"📚 Category: {category_name}\n"
-            f"🎯 Difficulty: {difficulty}\n"
-            "➕ Correct: +1\n"
-            "➖ Wrong: -0.25"
-        )
-
-    except Exception:
-        logger.exception("Failed to save question")
-
-        await message.reply_text(
-            "❌ Could not save the question. Check hosting logs."
-        )
-
-
-# ==================================================
-# QUESTION COUNT
-# ==================================================
-
-async def question_count(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not await owner_required(update):
-        return
-
-    try:
-        with SessionLocal() as db:
-            total = (
-                db.query(Question)
-                .filter(Question.active.is_(True))
-                .count()
-            )
-
-            categories = db.query(Category).count()
-
-        await update.effective_message.reply_text(
-            "📊 0xGREY QUESTION BANK\n\n"
-            f"📚 Categories: {categories}\n"
-            f"📝 Active questions: {total}"
-        )
-
-    except Exception:
-        logger.exception("Failed to count questions")
-
-        await update.effective_message.reply_text(
-            "❌ Could not retrieve question-bank statistics."
-        )
-
-
-# ==================================================
-# TEST POLL
-# ==================================================
-
-async def test_poll(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not await owner_required(update):
-        return
-
-    chat = update.effective_chat
-    message = update.effective_message
-
-    if chat is None or message is None:
-        return
-
-    display_name = get_display_name_safely(chat.id)
-
-    await message.reply_text(
-        f"📊 {display_name}: Publishing a sample quiz poll..."
-    )
-
-    try:
-        await context.bot.send_poll(
-            chat_id=chat.id,
-            question=f"{display_name} Demo Quiz: What is 2 + 2?",
-            options=["3", "4", "5", "6"],
-            type="quiz",
-            correct_option_id=1,
-            is_anonymous=False,
-            explanation="Two plus two equals four.",
-        )
-
-    except TelegramError:
-        logger.exception("Failed to send demo poll")
-
-        await message.reply_text(
-            "❌ Could not send the demo poll. Check bot permissions."
-        )
-
-
-# ==================================================
-# LOAD QUESTIONS FOR A QUIZ
-# ==================================================
-
-def load_quiz_questions(category_name: str, requested_count: int):
-    """Return detached quiz data."""
 
     with SessionLocal() as db:
         categories = db.query(Category).all()
@@ -1169,8 +765,280 @@ def load_quiz_questions(category_name: str, requested_count: int):
             None,
         )
 
-        if category is None:
-            return None, None, "category_not_found"
+        if not category:
+            await message.reply_text(
+                f"Category '{category_name}' does not exist."
+            )
+            return
+
+        question = Question(
+            category_id=category.id,
+            question_text=question_text,
+            option_a=option_a,
+            option_b=option_b,
+            option_c=option_c,
+            option_d=option_d,
+            correct_option=correct,
+            explanation=explanation,
+            difficulty=difficulty,
+            marks=1.0,
+            negative_marks=0.25,
+            active=True,
+        )
+
+        db.add(question)
+        db.commit()
+        db.refresh(question)
+
+        question_id = question.id
+
+    await message.reply_text(
+        "✅ QUESTION SAVED\n\n"
+        f"ID: {question_id}\n"
+        f"Category: {category_name}\n"
+        f"Difficulty: {difficulty}\n"
+        "Correct: +1\n"
+        "Wrong: -0.25"
+    )
+
+
+async def question_count(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    with SessionLocal() as db:
+        total = (
+            db.query(Question)
+            .filter(Question.active.is_(True))
+            .count()
+        )
+
+        categories = db.query(Category).count()
+
+    await update.effective_message.reply_text(
+        "📊 QUESTION BANK\n\n"
+        f"Categories: {categories}\n"
+        f"Active questions: {total}"
+    )
+
+
+# ============================================================
+# AI PERFORMANCE FEEDBACK
+# ============================================================
+
+def _call_ai_feedback(stats: dict) -> dict:
+    """
+    Optional synchronous AI request.
+
+    Uses Gemini or Groq when configured. Returns deterministic
+    fallback feedback if no provider is configured or the request
+    fails. Never fabricate historical performance.
+    """
+
+    prompt = f"""
+You are a concise exam performance coach for banking exam students.
+
+Use only these verified results:
+{json.dumps(stats, ensure_ascii=False)}
+
+Return ONLY valid JSON with exactly these keys:
+tagline, insight, quote
+
+Rules:
+- Keep the tagline under 100 characters.
+- Keep the insight under 350 characters.
+- Keep the quote under 180 characters.
+- Be constructive and specific to the supplied results.
+- Do not invent previous scores, improvement, ranks, or history.
+- Do not shame the student.
+"""
+
+    try:
+        if AI_PROVIDER == "gemini" and GEMINI_API_KEY:
+            from google import genai
+
+            client = genai.Client(api_key=GEMINI_API_KEY)
+
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+
+            content = (response.text or "").strip()
+
+        elif AI_PROVIDER == "groq" and GROQ_API_KEY:
+            from groq import Groq
+
+            client = Groq(api_key=GROQ_API_KEY)
+
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return only valid JSON. "
+                            "Do not invent statistics."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                temperature=0.6,
+            )
+
+            content = response.choices[0].message.content or ""
+
+        else:
+            return fallback_feedback(stats)
+
+        content = content.strip()
+
+        if content.startswith("```"):
+            content = content.replace("```json", "", 1)
+            content = content.replace("```", "").strip()
+
+        data = json.loads(content)
+
+        return {
+            "tagline": str(data["tagline"])[:300],
+            "insight": str(data["insight"])[:1000],
+            "quote": str(data["quote"])[:500],
+        }
+
+    except Exception:
+        logger.exception("AI feedback failed; using fallback")
+        return fallback_feedback(stats)
+
+
+async def generate_feedback(stats: dict) -> dict:
+    return await asyncio.to_thread(
+        _call_ai_feedback,
+        stats,
+    )
+
+
+def fallback_feedback(stats: dict) -> dict:
+    accuracy = float(stats.get("accuracy", 0))
+    correct = int(stats.get("correct", 0))
+    wrong = int(stats.get("wrong", 0))
+    unanswered = int(stats.get("unanswered", 0))
+
+    if accuracy >= 90:
+        tagline = "Outstanding accuracy — excellent work!"
+        insight = (
+            "Your attempted answers were highly accurate. "
+            "Keep practising difficult questions."
+        )
+    elif accuracy >= 75:
+        tagline = "Strong performance — keep building momentum."
+        insight = (
+            "Review the questions you missed and strengthen "
+            "the concepts that need more practice."
+        )
+    elif accuracy >= 50:
+        tagline = "Good progress — targeted practice can help."
+        insight = (
+            "Study the reasoning behind incorrect answers "
+            "and focus on accuracy."
+        )
+    elif correct > 0:
+        tagline = "Every correct answer is progress."
+        insight = (
+            "Identify weaker topics and practise similar questions."
+        )
+    else:
+        tagline = "Your preparation journey starts here."
+        insight = (
+            "Review the explanations and build your understanding "
+            "one topic at a time."
+        )
+
+    if unanswered:
+        insight += (
+            f" {unanswered} questions were unanswered; "
+            "review your time management."
+        )
+
+    if wrong > correct and wrong:
+        insight += (
+            " Incorrect answers exceeded correct answers. "
+            "Prioritise careful option analysis."
+        )
+
+    return {
+        "tagline": tagline,
+        "insight": insight,
+        "quote": random.choice(MOTIVATIONAL_QUOTES),
+    }
+
+
+# ============================================================
+# DEMO POLL
+# ============================================================
+
+async def test_poll(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    chat = update.effective_chat
+
+    if not chat:
+        return
+
+    name = safe_display_name(chat.id)
+
+    await context.bot.send_poll(
+        chat_id=chat.id,
+        question=f"{name}: What is 2 + 2?",
+        options=["3", "4", "5", "6"],
+        type="quiz",
+        correct_option_id=1,
+        is_anonymous=False,
+        explanation="Two plus two equals four.",
+    )
+
+
+# ============================================================
+# QUIZ SESSION TRACKING
+# ============================================================
+
+def get_sessions(context):
+    return context.application.bot_data.setdefault(
+        "quiz_sessions",
+        {},
+    )
+
+
+def get_poll_map(context):
+    return context.application.bot_data.setdefault(
+        "poll_map",
+        {},
+    )
+
+
+def load_questions(category_name: str, count: int):
+    with SessionLocal() as db:
+        categories = db.query(Category).all()
+
+        category = next(
+            (
+                item for item in categories
+                if item.name.casefold() == category_name.casefold()
+            ),
+            None,
+        )
+
+        if not category:
+            return None, None
 
         questions = (
             db.query(Question)
@@ -1181,150 +1049,176 @@ def load_quiz_questions(category_name: str, requested_count: int):
             .all()
         )
 
-        if not questions:
-            return category.name, None, "no_questions"
+        if len(questions) < count:
+            return category, None
 
-        count = min(requested_count, len(questions))
         selected = random.sample(questions, count)
 
-        quiz_data = [
-            {
-                "question": question.question_text,
-                "options": [
-                    ("A", question.option_a),
-                    ("B", question.option_b),
-                    ("C", question.option_c),
-                    ("D", question.option_d),
-                ],
-                "correct": question.correct_option,
-                "explanation": question.explanation or "",
-            }
-            for question in selected
-        ]
+        result = []
 
-        return category.name, quiz_data, None
+        for q in selected:
+            result.append({
+                "id": q.id,
+                "question": q.question_text,
+                "options": {
+                    "A": q.option_a,
+                    "B": q.option_b,
+                    "C": q.option_c,
+                    "D": q.option_d,
+                },
+                "correct": q.correct_option.upper(),
+                "explanation": q.explanation or "",
+            })
+
+        return category, result
 
 
-# ==================================================
-# SEND QUIZ POLLS
-# ==================================================
+# ============================================================
+# PUBLISH QUIZ
+# ============================================================
 
-async def send_quiz_polls(
+async def publish_quiz_to_chat(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     target_chat_id: int,
     category_name: str,
-    requested_count: int,
-    announce_in_current_chat: bool = True,
+    count: int,
 ):
-    """Publish shuffled Telegram quiz polls."""
-
-    if not await check_publish_permission_for_target(
-        update,
-        target_chat_id,
-    ):
-        return
-
-    actual_category, quiz_data, error = load_quiz_questions(
-        category_name,
-        requested_count,
-    )
-
     message = update.effective_message
 
-    if error == "category_not_found":
+    if not await can_publish_to(update, target_chat_id):
+        return
+
+    category, questions = load_questions(category_name, count)
+
+    if not category:
         await message.reply_text(
-            f"❌ Category '{category_name}' not found.\n"
-            "Use /categories to check category names."
+            f"Category '{category_name}' not found."
         )
         return
 
-    if error == "no_questions":
+    if questions is None:
         await message.reply_text(
-            "❌ This category has no active questions."
+            "Not enough active questions in this category."
         )
         return
 
-    if not quiz_data:
-        await message.reply_text(
-            "❌ No questions are available."
-        )
-        return
+    name = safe_display_name(target_chat_id)
 
-    if len(quiz_data) < requested_count:
-        await message.reply_text(
-            f"⚠️ You requested {requested_count} questions, "
-            f"but only {len(quiz_data)} are available.\n"
-            f"Publishing the available {len(quiz_data)}."
+    # Create a persistent quiz record.
+    with SessionLocal() as db:
+        quiz = Quiz(
+            title=f"{category.name} | {datetime.utcnow():%Y-%m-%d %H:%M}",
+            category_id=category.id,
+            question_count=len(questions),
+            duration_minutes=max(1, len(questions)),
+            marks_per_correct=1.0,
+            negative_marks=0.25,
+            shuffle_questions=True,
+            shuffle_options=True,
+            status="published",
         )
 
-    display_name = get_display_name_safely(target_chat_id)
+        db.add(quiz)
+        db.commit()
+        db.refresh(quiz)
 
-    if announce_in_current_chat:
-        await message.reply_text(
-            f"📢 {display_name}: Publishing {len(quiz_data)} quiz polls "
-            f"for {actual_category}.\n\n"
-            f"🆔 Target chat: {target_chat_id}\n"
-            "Each question will appear as a separate Telegram quiz poll."
-        )
+        quiz_id = quiz.id
+
+    session_id = str(quiz_id)
+
+    session = {
+        "quiz_id": quiz_id,
+        "title": f"{category.name} Quiz",
+        "category": category.name,
+        "group_id": target_chat_id,
+        "group_title": "",
+        "started_at": time.time(),
+        "questions": questions,
+        "participants": {},
+        "finalized": False,
+        "poll_ids": [],
+    }
+
+    try:
+        chat = await context.bot.get_chat(target_chat_id)
+        session["group_title"] = chat.title or ""
+    except TelegramError:
+        session["group_title"] = str(target_chat_id)
+
+    get_sessions(context)[session_id] = session
+
+    await message.reply_text(
+        "📣 QUIZ PUBLISHING STARTED\n\n"
+        f"Quiz ID: {session_id}\n"
+        f"Category: {category.name}\n"
+        f"Questions: {len(questions)}\n"
+        f"Target: {target_chat_id}\n\n"
+        f"After the quiz, use:\n/finalizequiz {session_id}"
+    )
+
+    poll_map = get_poll_map(context)
 
     sent = 0
     failed = 0
 
-    for item in quiz_data:
-        options = item["options"].copy()
+    for index, item in enumerate(questions, start=1):
+        options = list(item["options"].items())
         random.shuffle(options)
 
         option_texts = [
-            option_text[:100]
-            for _, option_text in options
+            text[:100]
+            for _, text in options
         ]
 
         correct_index = next(
-            index
-            for index, (label, _) in enumerate(options)
-            if label == item["correct"]
+            i
+            for i, (letter, _) in enumerate(options)
+            if letter == item["correct"]
         )
 
-        question_text = (
-            f"{display_name}: {item['question']}"
+        poll_question = (
+            f"{name} | Q{index}/{len(questions)}: "
+            f"{item['question']}"
         )[:300]
 
-        explanation = item["explanation"][:200] or None
-
         try:
-            await context.bot.send_poll(
+            poll_message = await context.bot.send_poll(
                 chat_id=target_chat_id,
-                question=question_text,
+                question=poll_question,
                 options=option_texts,
                 type="quiz",
                 correct_option_id=correct_index,
                 is_anonymous=False,
-                explanation=explanation,
+                explanation=item["explanation"][:200] or None,
             )
 
+            poll_id = poll_message.poll.id
+
+            poll_map[poll_id] = {
+                "session_id": session_id,
+                "question_id": item["id"],
+                "correct_index": correct_index,
+                "question_number": index,
+            }
+
+            session["poll_ids"].append(poll_id)
             sent += 1
+
             await asyncio.sleep(1.1)
 
         except TelegramError:
+            logger.exception("Failed to publish poll")
             failed += 1
-            logger.exception(
-                "Failed to publish a quiz poll to chat %s",
-                target_chat_id,
-            )
 
     await message.reply_text(
-        "🏁 QUIZ PUBLISHING FINISHED\n\n"
-        f"📚 Category: {actual_category}\n"
-        f"🆔 Target chat: {target_chat_id}\n"
-        f"✅ Polls published: {sent}\n"
-        f"❌ Failed: {failed}"
+        "🏁 PUBLISHING FINISHED\n\n"
+        f"Quiz ID: {session_id}\n"
+        f"Published: {sent}\n"
+        f"Failed: {failed}\n\n"
+        f"Finalize results with:\n/finalizequiz {session_id}"
     )
 
-
-# ==================================================
-# PUBLISH IN CURRENT CHAT
-# ==================================================
 
 async def publish_quiz(
     update: Update,
@@ -1335,11 +1229,7 @@ async def publish_quiz(
 
     if len(context.args) < 2:
         await update.effective_message.reply_text(
-            "Usage:\n"
-            "/publishquiz English 5\n"
-            "/publishquiz Banking Awareness 10\n\n"
-            "The final number is the question count.\n"
-            "For another approved group, use /publishquiz_to."
+            "Usage: /publishquiz English 10"
         )
         return
 
@@ -1347,34 +1237,26 @@ async def publish_quiz(
         count = int(context.args[-1])
     except ValueError:
         await update.effective_message.reply_text(
-            "❌ The last argument must be a number.\n"
-            "Example: /publishquiz English 5"
+            "The final argument must be the question count."
         )
         return
 
     if not 1 <= count <= 200:
         await update.effective_message.reply_text(
-            "❌ Choose between 1 and 200 questions."
+            "Choose between 1 and 200 questions."
         )
-        return
-
-    if not await check_publish_permission(update):
         return
 
     category_name = " ".join(context.args[:-1]).strip()
 
-    await send_quiz_polls(
-        update=update,
-        context=context,
-        target_chat_id=update.effective_chat.id,
-        category_name=category_name,
-        requested_count=count,
+    await publish_quiz_to_chat(
+        update,
+        context,
+        update.effective_chat.id,
+        category_name,
+        count,
     )
 
-
-# ==================================================
-# PUBLISH TO A SPECIFIC APPROVED GROUP
-# ==================================================
 
 async def publish_quiz_to(
     update: Update,
@@ -1385,59 +1267,484 @@ async def publish_quiz_to(
 
     if len(context.args) < 3:
         await update.effective_message.reply_text(
-            "Usage:\n"
-            "/publishquiz_to GROUP_ID COUNT CATEGORY\n\n"
-            "Examples:\n"
-            "/publishquiz_to -1001234567890 5 English\n"
-            "/publishquiz_to -1001234567890 10 Banking Awareness\n\n"
-            "Use /approved_groups to see approved group IDs."
+            "Usage: /publishquiz_to GROUP_ID COUNT CATEGORY"
         )
         return
 
     try:
-        group_id = int(context.args[0].strip())
+        group_id = int(context.args[0])
         count = int(context.args[1])
     except ValueError:
         await update.effective_message.reply_text(
-            "❌ Invalid group ID or question count."
+            "Invalid group ID or question count."
         )
         return
 
     if group_id >= 0:
         await update.effective_message.reply_text(
-            "❌ The target must be a Telegram group or supergroup ID."
+            "The target must be a group or supergroup ID."
         )
         return
 
     if not 1 <= count <= 200:
         await update.effective_message.reply_text(
-            "❌ Choose between 1 and 200 questions."
+            "Choose between 1 and 200 questions."
+        )
+        return
+
+    if not get_approved_group(str(group_id)):
+        await update.effective_message.reply_text(
+            "This group is not approved."
         )
         return
 
     category_name = " ".join(context.args[2:]).strip()
 
-    approved = get_approved_group(str(group_id))
-
-    if approved is None:
-        await update.effective_message.reply_text(
-            "⛔ This target group is not approved.\n"
-            "Use /approved_groups to check active approvals."
-        )
-        return
-
-    await send_quiz_polls(
-        update=update,
-        context=context,
-        target_chat_id=group_id,
-        category_name=category_name,
-        requested_count=count,
+    await publish_quiz_to_chat(
+        update,
+        context,
+        group_id,
+        category_name,
+        count,
     )
 
 
-# ==================================================
+# ============================================================
+# RECEIVE POLL ANSWERS
+# ============================================================
+
+async def handle_poll_answer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    answer = update.poll_answer
+
+    if not answer or not answer.user:
+        return
+
+    poll_map = get_poll_map(context)
+    metadata = poll_map.get(answer.poll_id)
+
+    if not metadata:
+        return
+
+    sessions = get_sessions(context)
+    session = sessions.get(metadata["session_id"])
+
+    if not session or session["finalized"]:
+        return
+
+    user = answer.user
+    user_id = str(user.id)
+
+    participant = session["participants"].setdefault(
+        user_id,
+        {
+            "user_id": user_id,
+            "name": user.full_name or "Student",
+            "username": user.username or "",
+            "answers": {},
+        },
+    )
+
+    selected = (
+        answer.option_ids[0]
+        if answer.option_ids
+        else None
+    )
+
+    participant["answers"][answer.poll_id] = {
+        "selected_index": selected,
+        "correct_index": metadata["correct_index"],
+        "question_id": metadata["question_id"],
+    }
+
+
+# ============================================================
+# LIST ACTIVE QUIZZES
+# ============================================================
+
+async def active_quizzes(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    sessions = get_sessions(context)
+
+    lines = ["📊 ACTIVE QUIZ SESSIONS\n"]
+
+    for session_id, session in sessions.items():
+        if session["finalized"]:
+            continue
+
+        lines.append(
+            f"Quiz ID: {session_id}\n"
+            f"Category: {session['category']}\n"
+            f"Group: {session['group_title']}\n"
+            f"Participants: {len(session['participants'])}\n"
+            f"Use /finalizequiz {session_id}\n"
+        )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+        if len(lines) > 1
+        else "No active quiz sessions."
+    )
+
+
+# ============================================================
+# FINALIZE QUIZ AND SAVE RESULTS
+# ============================================================
+
+async def finalize_quiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Usage: /finalizequiz QUIZ_ID"
+        )
+        return
+
+    session_id = context.args[0]
+    session = get_sessions(context).get(session_id)
+
+    if not session:
+        await update.effective_message.reply_text(
+            "Quiz session not found. Active sessions are held in memory."
+        )
+        return
+
+    if session["finalized"]:
+        await update.effective_message.reply_text(
+            "This quiz has already been finalized."
+        )
+        return
+
+    questions = session["questions"]
+    poll_ids = session["poll_ids"]
+
+    results = []
+
+    for participant in session["participants"].values():
+        correct = 0
+        wrong = 0
+
+        for poll_id in poll_ids:
+            answer = participant["answers"].get(poll_id)
+
+            if not answer or answer["selected_index"] is None:
+                continue
+
+            if answer["selected_index"] == answer["correct_index"]:
+                correct += 1
+            else:
+                wrong += 1
+
+        total = len(questions)
+        attempted = correct + wrong
+        unanswered = max(0, total - attempted)
+
+        score = correct - 0.25 * wrong
+        accuracy = (
+            correct / attempted * 100
+            if attempted
+            else 0.0
+        )
+
+        score_percent = (
+            score / total * 100
+            if total
+            else 0.0
+        )
+
+        results.append({
+            **participant,
+            "correct": correct,
+            "wrong": wrong,
+            "unanswered": unanswered,
+            "attempted": attempted,
+            "score": score,
+            "accuracy": accuracy,
+            "score_percent": score_percent,
+        })
+
+    results.sort(
+        key=lambda item: (
+            item["score"],
+            item["accuracy"],
+            item["correct"],
+        ),
+        reverse=True,
+    )
+
+    now = datetime.utcnow()
+    elapsed = max(
+        0,
+        int(time.time() - session["started_at"]),
+    )
+
+    # Save each participant's result.
+    with SessionLocal() as db:
+        for result in results:
+            stats = {
+                "correct": result["correct"],
+                "wrong": result["wrong"],
+                "unanswered": result["unanswered"],
+                "attempted": result["attempted"],
+                "accuracy": round(result["accuracy"], 2),
+                "score": round(result["score"], 2),
+                "question_count": len(questions),
+                "quiz_title": session["title"],
+            }
+
+            feedback = await generate_feedback(stats)
+
+            attempt = StudentAttempt(
+                quiz_id=session["quiz_id"],
+                student_telegram_id=result["user_id"],
+                student_name=result["name"],
+                group_id=str(session["group_id"]),
+                group_title=session["group_title"],
+                score=result["score"],
+                correct_count=result["correct"],
+                wrong_count=result["wrong"],
+                unanswered_count=result["unanswered"],
+                started_at=now,
+                submitted_at=now,
+                duration_seconds=elapsed,
+                accuracy_percent=result["accuracy"],
+                score_percent=result["score_percent"],
+                performance_tagline=feedback["tagline"],
+                performance_insight=feedback["insight"],
+                motivational_quote=feedback["quote"],
+                leaderboard_published=False,
+            )
+
+            db.add(attempt)
+
+        db.commit()
+
+        saved_attempts = (
+            db.query(StudentAttempt)
+            .filter(
+                StudentAttempt.quiz_id == session["quiz_id"],
+                StudentAttempt.group_id == str(session["group_id"]),
+            )
+            .order_by(
+                StudentAttempt.score.desc(),
+                StudentAttempt.accuracy_percent.desc(),
+            )
+            .all()
+        )
+
+        total_participants = len(saved_attempts)
+
+        for attempt in saved_attempts:
+            lower = sum(
+                1
+                for other in saved_attempts
+                if other.score < attempt.score
+            )
+
+            attempt.group_percentile = (
+                lower / (total_participants - 1) * 100
+                if total_participants > 1
+                else None
+            )
+
+            attempt.leaderboard_published = True
+
+        db.commit()
+
+    session["finalized"] = True
+
+    await update.effective_message.reply_text(
+        "✅ QUIZ FINALIZED\n\n"
+        f"Quiz ID: {session_id}\n"
+        f"Participants recorded: {len(results)}\n"
+        "Scores saved to the database.\n\n"
+        f"View results with:\n/leaderboard {session_id}"
+    )
+
+    await publish_leaderboard(
+        update,
+        context,
+        session["quiz_id"],
+        str(session["group_id"]),
+    )
+
+
+# ============================================================
+# PREMIUM LEADERBOARD
+# ============================================================
+
+async def publish_leaderboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    quiz_id: int,
+    group_id: str,
+):
+    with SessionLocal() as db:
+        attempts = (
+            db.query(StudentAttempt)
+            .filter(
+                StudentAttempt.quiz_id == quiz_id,
+                StudentAttempt.group_id == str(group_id),
+            )
+            .order_by(
+                StudentAttempt.score.desc(),
+                StudentAttempt.accuracy_percent.desc(),
+                StudentAttempt.submitted_at.asc(),
+            )
+            .all()
+        )
+
+        quiz = db.get(Quiz, quiz_id)
+
+        if not attempts or not quiz:
+            await update.effective_message.reply_text(
+                "No saved results are available."
+            )
+            return
+
+        total_questions = quiz.question_count
+        group_title = attempts[0].group_title or str(group_id)
+
+        lines = [
+            "🌟🏆 PH MOCK TEST RESULTS 🏆🌟",
+            f"📚 {quiz.title}",
+            "💎 FINAL SCOREBOARD 💎",
+            "",
+            "📊 QUIZ SNAPSHOT",
+            f"📝 Questions: {total_questions}",
+            f"👥 Group: {group_title}",
+            f"👤 Participants: {len(attempts)}",
+            "➕ Correct: +1",
+            "➖ Wrong: -0.25",
+            "⭕ Unanswered: 0",
+            "",
+        ]
+
+        for rank, attempt in enumerate(attempts, start=1):
+            attempted = (
+                attempt.correct_count + attempt.wrong_count
+            )
+
+            percentile = (
+                f"{attempt.group_percentile:.1f}%"
+                if attempt.group_percentile is not None
+                else "N/A"
+            )
+
+            lines.extend([
+                f"🏅 RANK #{rank} — {attempt.student_name}",
+                f"🎯 Score: {attempt.score:.2f}/{total_questions}",
+                f"📈 Score Percentage: {attempt.score_percent:.1f}%",
+                f"🎯 Accuracy: {attempt.accuracy_percent:.1f}%",
+                f"📊 Group Percentile: {percentile}",
+                f"✅ Correct: {attempt.correct_count}",
+                f"❌ Wrong: {attempt.wrong_count}",
+                f"⭕ Unanswered: {attempt.unanswered_count}",
+                f"📝 Attempted: {attempted}/{total_questions}",
+                f"⏱️ Time: {attempt.duration_seconds // 60}m "
+                f"{attempt.duration_seconds % 60}s",
+                "",
+                f"💡 {attempt.performance_tagline}",
+                f"🧠 {attempt.performance_insight}",
+                f"✨ “{attempt.motivational_quote}”",
+                "",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "",
+            ])
+
+        lines.extend([
+            "📌 PERFORMANCE KEY",
+            "Accuracy = Correct ÷ Attempted × 100",
+            "Score = Correct − (Wrong × 0.25)",
+            "",
+            "✍️ Created by PH",
+        ])
+
+    text = "\n".join(lines)
+
+    # Telegram messages have a maximum message length.
+    # Split the leaderboard into safe-sized chunks.
+    chunks = []
+
+    while len(text) > 3500:
+        split_at = text.rfind("\n", 0, 3500)
+
+        if split_at <= 0:
+            split_at = 3500
+
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+
+    if text:
+        chunks.append(text)
+
+    for chunk in chunks:
+        await update.effective_message.reply_text(chunk)
+
+
+async def leaderboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await owner_required(update):
+        return
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Usage: /leaderboard QUIZ_ID"
+        )
+        return
+
+    try:
+        quiz_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Quiz ID must be a number."
+        )
+        return
+
+    session = get_sessions(context).get(str(quiz_id))
+
+    if session:
+        group_id = str(session["group_id"])
+    else:
+        with SessionLocal() as db:
+            attempt = (
+                db.query(StudentAttempt)
+                .filter(StudentAttempt.quiz_id == quiz_id)
+                .first()
+            )
+
+            if not attempt:
+                await update.effective_message.reply_text(
+                    "No saved results found for this quiz."
+                )
+                return
+
+            group_id = attempt.group_id
+
+    await publish_leaderboard(
+        update,
+        context,
+        quiz_id,
+        group_id,
+    )
+
+
+# ============================================================
 # ERROR HANDLER
-# ==================================================
+# ============================================================
 
 async def error_handler(
     update: object,
@@ -1449,20 +1756,19 @@ async def error_handler(
     )
 
 
-# ==================================================
+# ============================================================
 # MAIN APPLICATION
-# ==================================================
+# ============================================================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing. "
-            "Configure it in hosting environment variables."
+            "Set TELEGRAM_BOT_TOKEN or BOT_TOKEN."
         )
 
     if not OWNER_ID.isdigit():
         raise RuntimeError(
-            "TELEGRAM_OWNER_ID must contain your numeric Telegram user ID."
+            "Set TELEGRAM_OWNER_ID to your numeric Telegram user ID."
         )
 
     init_db()
@@ -1473,12 +1779,12 @@ def main():
         .build()
     )
 
-    # General commands
+    # General
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
 
-    # Custom chat display name
+    # Chat names
     application.add_handler(
         CommandHandler("set_chat_name", set_chat_name)
     )
@@ -1503,18 +1809,7 @@ def main():
         CommandHandler("questioncount", question_count)
     )
 
-    # Quiz publishing
-    application.add_handler(
-        CommandHandler("testpoll", test_poll)
-    )
-    application.add_handler(
-        CommandHandler("publishquiz", publish_quiz)
-    )
-    application.add_handler(
-        CommandHandler("publishquiz_to", publish_quiz_to)
-    )
-
-    # Group access management
+    # Group access
     application.add_handler(
         CommandHandler("request_access", request_access)
     )
@@ -1529,6 +1824,33 @@ def main():
     )
     application.add_handler(
         CommandHandler("approved_groups", approved_groups)
+    )
+
+    # Quiz publishing
+    application.add_handler(
+        CommandHandler("publishquiz", publish_quiz)
+    )
+    application.add_handler(
+        CommandHandler("publishquiz_to", publish_quiz_to)
+    )
+    application.add_handler(
+        CommandHandler("testpoll", test_poll)
+    )
+
+    # Quiz results
+    application.add_handler(
+        CommandHandler("activequizzes", active_quizzes)
+    )
+    application.add_handler(
+        CommandHandler("finalizequiz", finalize_quiz)
+    )
+    application.add_handler(
+        CommandHandler("leaderboard", leaderboard)
+    )
+
+    # Collect non-anonymous Telegram poll answers.
+    application.add_handler(
+        PollAnswerHandler(handle_poll_answer)
     )
 
     application.add_error_handler(error_handler)
