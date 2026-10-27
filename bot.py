@@ -798,7 +798,26 @@ async def add_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(first) != 2:
         await message.reply_text(
             "Usage: /addquestion CATEGORY\n"
-            "Then send the question fields in your next message."
+            "Then send the question, options, correct answer, explanation, and difficulty."
+        )
+        return
+
+    category_name = first[1].strip()
+    raw_text = "\n".join(parts[1:]).strip()
+    if raw_text:
+        await save_question_fields(update, context, category_name, raw_text)
+        return
+
+    context.user_data["pending_add_question_category"] = category_name
+    await message.reply_text(
+        "Send one question using this format:\n\n"
+        "Question: What is 2 + 2?\n"
+        "A: 3\nB: 4\nC: 5\nD: 6\n"
+        "Correct: B\n"
+        "Explanation: Two plus two equals four.\n"
+        "Difficulty: Easy"
+    )
+              "Then send the question fields in your next message."
         )
         return
 
@@ -1046,7 +1065,6 @@ async def publish_quiz_to_chat(
 
 
 
-
 def parse_bulk_question_blocks(raw_text: str) -> list[dict]:
     # Best-effort parser for common human-written MCQ layouts.
     text_value = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -1119,7 +1137,7 @@ async def normalize_bulk_questions_with_ai(raw_text: str) -> list[dict]:
     # Use the configured AI model to normalize varied pasted/PDF MCQ layouts.
     if not raw_text.strip():
         return []
-    prompt = '''You are an exam-question format normalizer. Convert the supplied source text into a JSON array of multiple-choice questions. The source may use any numbering, bullets, option labels, layout, answer-key wording, or PDF line wrapping.
+    prompt = '''You are an exam-question format normalizer. Convert the supplied source text into a JSON array of multiple-choice questions. The source may use any numbering, bullets, option labels, answer-key wording, layout, or PDF line wrapping.
 
 Rules:
 - Extract only questions actually present in the source; preserve the original meaning and facts.
@@ -1199,6 +1217,7 @@ async def import_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(
             f"Category '{category_name}' not found. Create it first with /addcategory {category_name}."
         )
+              )
         return
     context.user_data["pending_bulk_import"] = {
         "category": category.name,
@@ -1398,7 +1417,7 @@ async def run_sequential_quiz(context: ContextTypes.DEFAULT_TYPE, session_key: s
                 "negative": float(item.get("negative", 0.25)),
             }
             get_poll_index(context)[poll_id] = metadata
-            session.setdefault("poll_ids", []).append(poll_id)
+                      session.setdefault("poll_ids", []).append(poll_id)
             session.setdefault("poll_metadata", {})[str(poll_id)] = {
                 k: v for k, v in metadata.items() if k != "session_key"
             }
@@ -1497,7 +1516,7 @@ async def publish_quiz_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Question count must be from 1 to 200.")
         return
     if not active_approved_group(group_id):
-        await update.effective_message.reply_text("⛔ This group is not approved.")
+        await update.effective_message.reply_text("This group is not approved.")
         return
     category_name = " ".join(args[2:]).strip()
     await publish_quiz_to_chat(update, context, group_id, category_name, count, timer)
@@ -1555,12 +1574,12 @@ async def set_quiz_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("GROUP_ID must be a numeric Telegram group ID.")
         return
     if group_id >= 0:
-        await update.effective_message.reply_text("⛔ Target must be a group/supergroup ID (normally starts with -100).")
+        await update.effective_message.reply_text("Target must be a group/supergroup ID (normally starts with -100).")
         return
     approved = active_approved_group(group_id)
     if not approved:
         await update.effective_message.reply_text(
-            "⛔ This group is not currently owner-approved. Approve it first with /approve_group GROUP_ID."
+            "This group is not currently owner-approved. Approve it first with /approve_group GROUP_ID."
         )
         return
     session = get_sessions(context).get(key)
@@ -1568,13 +1587,13 @@ async def set_quiz_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Quiz session not found or already finalized. Check /activequizzes.")
         return
     if not session.get("awaiting_approval"):
-        await update.effective_message.reply_text("⛔ Target cannot be changed after publishing has been approved or started.")
+        await update.effective_message.reply_text("Target cannot be changed after publishing has been approved or started.")
         return
     session["group_id"] = str(group_id)
     session["group_title"] = str(getattr(approved, "group_title", "") or group_id)
     persist_live_session(session)
     await update.effective_message.reply_text(
-        f"✅ Preview target set for quiz {key}.\n"
+        f"Preview target set for quiz {key}.\n"
         f"Group: {session['group_title']}\n"
         f"Group ID: {group_id}\n"
         f"No polls sent yet. Review, then use /approvequiz {key}."
@@ -1592,27 +1611,27 @@ async def approve_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_sessions(context).get(key)
     if not session:
         await update.effective_message.reply_text(
-            "❌ Quiz session not found. Check /activequizzes."
+            "Quiz session not found. Check /activequizzes."
         )
         return
     if session.get("finalized"):
         await update.effective_message.reply_text("This quiz is already finalized.")
         return
-    if not session.get("awaiting_approval"):
+          if not session.get("awaiting_approval"):
         await update.effective_message.reply_text(
-            f"✅ Quiz {key} has already been approved or started."
+            f"Quiz {key} has already been approved or started."
         )
         return
     target_chat_id = int(session["group_id"])
     if target_chat_id >= 0:
         await update.effective_message.reply_text(
-            "🔒 Preview only: select an owner-approved group first with "
+            "Preview only: select an owner-approved group first with "
             f"/setquiztarget {key} GROUP_ID. Private bot chats never receive quiz polls."
         )
         return
     if not active_approved_group(target_chat_id):
         await update.effective_message.reply_text(
-            "⛔ The target group is not currently owner-approved. Set an approved group with /setquiztarget."
+            "The target group is not currently owner-approved. Set an approved group with /setquiztarget."
         )
         return
     session["awaiting_approval"] = False
@@ -1624,7 +1643,7 @@ async def approve_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             quiz.status = "published"
             db.commit()
     await update.effective_message.reply_text(
-        f"✅ Quiz {key} approved. Sequential publishing is starting now."
+        f"Quiz {key} approved. Sequential publishing is starting now."
     )
     context.application.create_task(run_sequential_quiz(context, key))
 
@@ -1633,7 +1652,7 @@ async def active_quizzes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await owner_required(update):
         return
     sessions = get_sessions(context)
-    lines = ["📊 ACTIVE QUIZZES\n"]
+    lines = ["ACTIVE QUIZZES\n"]
     for key, session in sessions.items():
         if not session["finalized"]:
             if session.get("awaiting_approval"):
@@ -1790,7 +1809,7 @@ async def finalize_quiz(
     session["finalized"] = True
     persist_live_session(session)
     await update.effective_message.reply_text(
-        f"✅ Quiz {key} finalized.\n"
+        f"Quiz {key} finalized.\n"
         f"Participants recorded: {n}\n"
         "Results and student display names saved to the database.\n"
         "Publishing leaderboard..."
@@ -1798,9 +1817,7 @@ async def finalize_quiz(
     await show_leaderboard(
         update, context, int(session["quiz_id"]), session["group_id"]
     )
-
-
-async def show_leaderboard(
+ async def show_leaderboard(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     quiz_id: int,
@@ -1957,7 +1974,6 @@ async def resume_sequential_sessions(app: Application):
             app.create_task(run_sequential_quiz(app, str(key)))
 
 
-
 # ---------------------------------------------------------------------
 # Saved quiz-link library (persistent, owner-managed)
 # ---------------------------------------------------------------------
@@ -1998,8 +2014,6 @@ def get_saved_link(link_id: int):
     with SessionLocal() as db:
         row = db.execute(text("SELECT * FROM saved_quiz_links WHERE id=:id"), {"id": link_id}).mappings().first()
         return dict(row) if row else None
-
-
 def link_keyboard(link_id: int, enabled: bool):
     status_text = "Disable access" if enabled else "Enable access"
     return InlineKeyboardMarkup([
@@ -2147,7 +2161,7 @@ async def saved_link_text_handler(update: Update, context: ContextTypes.DEFAULT_
             db.commit()
             new_id = db.execute(text("SELECT MAX(id) FROM saved_quiz_links")).scalar()
         context.user_data.pop("saved_link_flow", None)
-        await update.effective_message.reply_text(f"✅ Saved '{file_name}' as link #{new_id}. You can manage its name, URL, password and access with /links.")
+        await update.effective_message.reply_text(f"Saved '{file_name}' as link #{new_id}. You can manage its name, URL, password and access with /links.")
         await show_saved_links(update.effective_message, context)
     elif step == "rename":
         if not raw or len(raw) > 150:
@@ -2157,9 +2171,9 @@ async def saved_link_text_handler(update: Update, context: ContextTypes.DEFAULT_
             db.execute(text("UPDATE saved_quiz_links SET file_name=:name, updated_at=:now WHERE id=:id"), {"name": raw, "now": datetime.utcnow().isoformat(), "id": flow["link_id"]})
             db.commit()
         context.user_data.pop("saved_link_flow", None)
-        await update.effective_message.reply_text("✅ File name updated.")
+        await update.effective_message.reply_text("File name updated.")
         record = get_saved_link(flow["link_id"])
-        await update.effective_message.reply_text(f"📚 {record['file_name']}", reply_markup=link_keyboard(flow["link_id"], bool(record["enabled"])))
+        await update.effective_message.reply_text(f"{record['file_name']}", reply_markup=link_keyboard(flow["link_id"], bool(record["enabled"])))
     elif step == "url":
         if not raw.startswith("https://"):
             await update.effective_message.reply_text("For security, the URL must start with https://")
@@ -2168,7 +2182,7 @@ async def saved_link_text_handler(update: Update, context: ContextTypes.DEFAULT_
             db.execute(text("UPDATE saved_quiz_links SET url=:url, updated_at=:now WHERE id=:id"), {"url": raw, "now": datetime.utcnow().isoformat(), "id": flow["link_id"]})
             db.commit()
         context.user_data.pop("saved_link_flow", None)
-        await update.effective_message.reply_text("✅ URL updated.")
+        await update.effective_message.reply_text("URL updated.")
     elif step == "password":
         if len(raw) < 8:
             await update.effective_message.reply_text("Password must be at least 8 characters.")
@@ -2178,13 +2192,13 @@ async def saved_link_text_handler(update: Update, context: ContextTypes.DEFAULT_
             db.execute(text("UPDATE saved_quiz_links SET password_hash=:hash, password_salt=:salt, updated_at=:now WHERE id=:id"), {"hash": digest, "salt": salt, "now": datetime.utcnow().isoformat(), "id": flow["link_id"]})
             db.commit()
         context.user_data.pop("saved_link_flow", None)
-        await update.effective_message.reply_text("🔐 Password changed. The bot does not display or store it in plain text.")
+        await update.effective_message.reply_text("Password changed. The bot does not display or store it in plain text.")
     elif step == "delete_confirm":
         if raw.upper() == "YES":
             with SessionLocal() as db:
                 db.execute(text("DELETE FROM saved_quiz_links WHERE id=:id"), {"id": flow["link_id"]})
                 db.commit()
-            await update.effective_message.reply_text("🗑 Saved link deleted from the bot's library.")
+            await update.effective_message.reply_text("Saved link deleted from the bot's library.")
         else:
             await update.effective_message.reply_text("Deletion cancelled.")
         context.user_data.pop("saved_link_flow", None)
@@ -2198,207 +2212,7 @@ async def member_quizlink_command(update: Update, context: ContextTypes.DEFAULT_
     if not context.args or not context.args[0].isdigit():
         await update.effective_message.reply_text("Usage: /quizlink LINK_ID")
         return
-    link_id = int(context.args[0])
-    record = get_saved_link(link_id)
-    if not record or not record["enabled"]:
-        await update.effective_message.reply_text("⛔ This quiz link is unavailable or disabled.")
-        return
-    context.user_data["quizlink_password_check"] = link_id
-    await update.effective_message.reply_text("🔐 Enter the password provided by the quiz owner. Do not send it in a group.")
-
-
-async def quizlink_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link_id = context.user_data.get("quizlink_password_check")
-    if not link_id or not update.effective_message or not update.effective_message.text:
-        return
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return
-    record = get_saved_link(int(link_id))
-    supplied = update.effective_message.text.strip()
-    context.user_data.pop("quizlink_password_check", None)
-    if not record or not record["enabled"] or not link_password_matches(supplied, record["password_salt"], record["password_hash"]):
-        await update.effective_message.reply_text("⛔ Incorrect password or link disabled. Ask the owner if you need access.")
-        return
-    # Password unlocks the actual Telegram quiz when this saved link is associated
-    # with a prepared quiz session. No external website is required for this flow.
-    quiz_id = str(record.get("quiz_id") or "").strip()
-    quiz_session = get_sessions(context).get(quiz_id) if quiz_id else None
-    if quiz_session and quiz_session.get("questions"):
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Start Telegram Quiz", callback_data=f"pq:start:{int(link_id)}")],
-            [InlineKeyboardButton("🔒 Close", callback_data=f"sl:memberclose:{int(link_id)}")],
-        ])
-        await update.effective_message.reply_text(
-            f"✅ Access granted\n📚 {record['file_name']}\n"
-            f"📝 Questions: {len(quiz_session['questions'])}\n\n"
-            "Tap Start Telegram Quiz to answer privately in this bot chat. "
-            "Your answers and score are separate from group polls.",
-            reply_markup=keyboard,
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "🔐 Password accepted, but this saved link is not connected to an available quiz session.\n\n"
-        "Ask the owner to edit the saved link and enter the correct Quiz ID from /activequizzes. "
-        "The external URL is not used as a substitute for a Telegram quiz."
-    )
-
-
-async def send_private_quiz_question(context: ContextTypes.DEFAULT_TYPE, attempt_token: str):
-    attempts = context.application.bot_data.setdefault("private_quiz_attempts", {})
-    attempt = attempts.get(attempt_token)
-    if not attempt or attempt.get("finished"):
-        return
-    questions = attempt["questions"]
-    index = int(attempt["index"])
-    if index >= len(questions):
-        await finish_private_quiz(context, attempt_token)
-        return
-
-    item = questions[index]
-    choices = list(item["options"].items())
-    random.shuffle(choices)
-    attempt["current_choices"] = [letter for letter, _ in choices]
-    attempt["answered_current"] = False
-    attempt["current_message_id"] = None
-    keyboard_rows = []
-    for pos, (letter, value) in enumerate(choices):
-        keyboard_rows.append([InlineKeyboardButton(
-            f"{chr(65 + pos)}. {str(value)[:70]}",
-            callback_data=f"pq:ans:{attempt_token}:{index}:{pos}"
-        )])
-    timer = max(5, min(600, int(attempt.get("timer", 30))))
-    msg = await context.bot.send_message(
-        chat_id=attempt["chat_id"],
-        text=(f"📚 {attempt['title']}\nQuestion {index + 1}/{len(questions)}\n\n"
-              f"{item['text']}\n\n⏱ Time: {timer} seconds"),
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
-    )
-    attempt["current_message_id"] = msg.message_id
-    context.application.create_task(private_question_timeout(context, attempt_token, index, timer))
-
-
-async def private_question_timeout(context: ContextTypes.DEFAULT_TYPE, attempt_token: str, question_index: int, timer: int):
-    await asyncio.sleep(timer)
-    attempts = context.application.bot_data.setdefault("private_quiz_attempts", {})
-    attempt = attempts.get(attempt_token)
-    if not attempt or attempt.get("finished") or attempt.get("index") != question_index or attempt.get("answered_current"):
-        return
-    attempt["answered_current"] = True
-    attempt["unanswered"] = int(attempt.get("unanswered", 0)) + 1
-    message_id = attempt.get("current_message_id")
-    if message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=attempt["chat_id"], message_id=message_id,
-                text=f"⏱ Time is up for question {question_index + 1}. No marks awarded."
-            )
-        except TelegramError:
-            pass
-    attempt["index"] += 1
-    await send_private_quiz_question(context, attempt_token)
-
-
-async def finish_private_quiz(context: ContextTypes.DEFAULT_TYPE, attempt_token: str):
-    attempts = context.application.bot_data.setdefault("private_quiz_attempts", {})
-    attempt = attempts.get(attempt_token)
-    if not attempt or attempt.get("finished"):
-        return
-    attempt["finished"] = True
-    total = len(attempt["questions"])
-    attempted = int(attempt.get("attempted", 0))
-    unanswered = int(attempt.get("unanswered", 0))
-    score = float(attempt.get("score", 0.0))
-    await context.bot.send_message(
-        chat_id=attempt["chat_id"],
-        text=(f"🏁 QUIZ COMPLETED\n{attempt['title']}\n\n"
-              f"Questions: {total}\nAttempted: {attempted}\nUnanswered: {unanswered}\n"
-              f"Correct: {attempt.get('correct', 0)}\nWrong: {attempt.get('wrong', 0)}\n"
-              f"Net score: {score:.2f} / {total}\n\n"
-              "+1 correct • −0.25 wrong • 0 unanswered\n"
-              "This is your private-chat attempt; group poll scores are tracked separately."),
-    )
-
-
-async def private_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query or not update.effective_user:
-        return
-    data = query.data or ""
-    if not update.effective_chat or update.effective_chat.type != "private":
-        await query.answer("Open the bot privately to take this quiz.", show_alert=True)
-        return
-
-    parts = data.split(":")
-    if len(parts) == 3 and parts[1] == "start":
-        await query.answer()
-        link_id = int(parts[2])
-        record = get_saved_link(link_id)
-        if not record or not record["enabled"]:
-            await query.message.reply_text("⛔ This quiz link is disabled or unavailable.")
-            return
-        quiz_id = str(record.get("quiz_id") or "")
-        session = get_sessions(context).get(quiz_id)
-        if not session or not session.get("questions"):
-            await query.message.reply_text("⛔ Quiz session unavailable. Ask the owner to check the saved Quiz ID.")
-            return
-        token = secrets.token_hex(5)
-        attempts = context.application.bot_data.setdefault("private_quiz_attempts", {})
-        attempts[token] = {
-            "user_id": str(update.effective_user.id), "chat_id": update.effective_chat.id,
-            "link_id": link_id, "quiz_id": quiz_id, "title": record["file_name"],
-            "questions": list(session["questions"]), "index": 0, "score": 0.0,
-            "correct": 0, "wrong": 0, "attempted": 0, "unanswered": 0,
-            "timer": int(session.get("time_limit_seconds", 30)), "finished": False,
-        }
-        await send_private_quiz_question(context, token)
-        return
-
-    if len(parts) == 5 and parts[1] == "ans":
-        token = parts[2]
-        try:
-            question_index, choice_pos = int(parts[3]), int(parts[4])
-        except ValueError:
-            await query.answer("Invalid answer button.", show_alert=True)
-            return
-        attempts = context.application.bot_data.setdefault("private_quiz_attempts", {})
-        attempt = attempts.get(token)
-        if (not attempt or attempt.get("finished")
-                or attempt.get("user_id") != str(update.effective_user.id)
-                or attempt.get("index") != question_index
-                or attempt.get("answered_current")):
-            await query.answer("This question is no longer active.", show_alert=True)
-            return
-        choices = attempt.get("current_choices", [])
-        if choice_pos < 0 or choice_pos >= len(choices):
-            await query.answer("Invalid option.", show_alert=True)
-            return
-        await query.answer()
-        attempt["answered_current"] = True
-        item = attempt["questions"][question_index]
-        selected_letter = choices[choice_pos]
-        correct_letter = str(item.get("correct", "")).upper()
-        attempt["attempted"] += 1
-        if selected_letter == correct_letter:
-            attempt["score"] += float(item.get("marks", 1.0))
-            attempt["correct"] += 1
-            result = "✅ Correct! +1 mark"
-        else:
-            attempt["score"] -= float(item.get("negative", 0.25))
-            attempt["wrong"] += 1
-            result = f"❌ Incorrect. −{float(item.get('negative', 0.25)):g} mark"
-        explanation = str(item.get("explanation", "") or "")
-        try:
-            await query.message.edit_text(
-                f"{result}\n\nCorrect answer: {correct_letter}. {item['options'].get(correct_letter, '')}"
-                + (f"\n\nExplanation: {explanation}" if explanation else "")
-            )
-        except TelegramError:
-            pass
-        attempt["index"] += 1
-        await send_private_quiz_question(context, token)
-        return
-    await query.answer()
+         await query.answer()
 
 
 def main():
@@ -2468,4 +2282,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
