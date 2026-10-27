@@ -2,7 +2,11 @@ fastapi
 uvicorn[standard]
 SQLAlchemy
 psycopg[binary]
-python-telegram-bot
+python-telegram-bot>=20.8,<23.0
 httpx
 google-genai
 groq
+Pillow>=10.0.0
+pypdf>=5.0.0
+pdf2image>=1.17.0
+pytesseract>=0.3.13
