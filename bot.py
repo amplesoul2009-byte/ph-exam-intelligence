@@ -1,11 +1,9 @@
 
 """PH Practice Hub / 0xGREY Telegram bot entry point.
 
-Owner-controlled quiz management.
+Owner-controlled quiz management and subject management.
 Only owner-approved groups receive quiz polls.
-
-Participant attempts are created automatically when a student
-answers their first registered poll.
+Participant attempts are created when students answer registered polls.
 """
 
 from __future__ import annotations
@@ -51,7 +49,13 @@ from quiz_import_service import (
     import_quiz_text,
 )
 from leaderboard_publisher import publish_group_leaderboard
-
+from subjects import (
+    add_subject,
+    deactivate_subject,
+    ensure_default_subjects,
+    list_subjects,
+    rename_subject,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ph_practice_hub")
@@ -84,28 +88,33 @@ async def help_command(
 
     await message.reply_text(
         "🪷 PH PRACTICE HUB — COMMANDS\n\n"
-        "Public:\n"
+        "PUBLIC:\n"
         "/start\n"
         "/help\n\n"
-        "OWNER ONLY:\n"
+        "OWNER ONLY — GROUPS:\n"
         "/approvegroup CHAT_ID\n"
         "/revokegroup CHAT_ID\n"
-        "/groups\n"
+        "/groups\n\n"
+        "OWNER ONLY — SUBJECTS:\n"
+        "/subjects\n"
+        "/addsubject NAME\n"
+        "/renamesubject SUBJECT_ID | NEW NAME\n"
+        "/deletesubject SUBJECT_ID\n\n"
+        "OWNER ONLY — QUIZZES:\n"
         "/importquiz TITLE | SUBJECT | LEVEL | YYYY-MM-DD\n"
         "/cancelimport\n"
         "/quizzes\n"
         "/approvequiz QUIZ_ID\n"
         "/publishquiz QUIZ_ID\n"
         "/endquiz QUIZ_ID CHAT_ID\n\n"
-        "Subjects: quant, reasoning, english, computer\n"
         "Levels: prelims, mains\n\n"
-        "Import instructions:\n"
+        "IMPORT INSTRUCTIONS:\n"
         "1. Send /importquiz with the quiz details.\n"
         "2. Send all numbered questions in one message.\n"
         "3. Review the saved draft and answer keys.\n"
-        "4. Use /approvequiz ID only after checking every answer.\n"
+        "4. Use /approvequiz ID after checking every answer.\n"
         "5. Use /publishquiz ID to send polls to approved groups.\n\n"
-        "Question format:\n"
+        "QUESTION FORMAT:\n"
         "1. Question text\n"
         "A. First option\n"
         "B. Second option\n"
@@ -193,8 +202,152 @@ async def groups_command(
             f"{group['chat_id']}"
         )
 
-    await message.reply_text("\n".join(lines))
+    await message.reply_text("\n".join(lines)[:4000])
 
+
+# ---------------- SUBJECT MANAGEMENT ----------------
+
+async def subjects_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    try:
+        with SessionLocal() as db:
+            ensure_default_subjects(db)
+            subjects = list_subjects(db)
+
+            lines = ["PH PRACTICE HUB — SUBJECTS", ""]
+
+            for item in subjects:
+                status = "ACTIVE" if item.active else "DISABLED"
+                lines.append(
+                    f"{item.subject_id} — {item.name} [{status}]"
+                )
+
+        await message.reply_text(
+            "\n".join(lines)[:4000]
+            if subjects
+            else "No subjects configured."
+        )
+    except Exception:
+        logger.exception("Could not list subjects")
+        await message.reply_text(
+            "Could not list subjects. Check deployment logs."
+        )
+
+
+async def addsubject_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    name = " ".join(context.args).strip()
+
+    if not name:
+        await message.reply_text(
+            "Usage: /addsubject Current Affairs"
+        )
+        return
+
+    try:
+        with SessionLocal() as db:
+            ensure_default_subjects(db)
+            item, action = add_subject(db, name)
+
+        await message.reply_text(
+            f"Subject {action}: {item.name}\n"
+            f"Subject ID: {item.subject_id}\n"
+            "Use this ID in /importquiz."
+        )
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+    except Exception:
+        logger.exception("Could not add subject")
+        await message.reply_text(
+            "Could not add subject. Check deployment logs."
+        )
+
+
+async def renamesubject_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    parts = " ".join(context.args).split("|", 1)
+
+    if len(parts) != 2 or not all(part.strip() for part in parts):
+        await message.reply_text(
+            "Usage: /renamesubject SUBJECT_ID | NEW NAME\n"
+            "Example: /renamesubject current_affairs | Daily CA"
+        )
+        return
+
+    try:
+        with SessionLocal() as db:
+            item = rename_subject(
+                db,
+                parts[0].strip(),
+                parts[1].strip(),
+            )
+
+        await message.reply_text(
+            "Subject renamed successfully.\n"
+            f"ID: {item.subject_id}\n"
+            f"Name: {item.name}"
+        )
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+    except Exception:
+        logger.exception("Could not rename subject")
+        await message.reply_text(
+            "Could not rename subject. Check deployment logs."
+        )
+
+
+async def deletesubject_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if len(context.args) != 1:
+        await message.reply_text(
+            "Usage: /deletesubject SUBJECT_ID\n"
+            "This disables the subject for new imports. "
+            "Existing quizzes and results are preserved."
+        )
+        return
+
+    try:
+        with SessionLocal() as db:
+            item = deactivate_subject(db, context.args[0])
+
+        await message.reply_text(
+            f"Subject disabled: {item.name} ({item.subject_id}).\n"
+            "Existing quizzes and student results are preserved."
+        )
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+    except Exception:
+        logger.exception("Could not disable subject")
+        await message.reply_text(
+            "Could not disable subject. Check deployment logs."
+        )
+
+
+# ---------------- QUIZ IMPORT ----------------
 
 async def importquiz(
     update: Update,
@@ -299,7 +452,6 @@ async def receive_import_text(
 
     except Exception:
         logger.exception("Quiz import failed")
-
         await message.reply_text(
             "The import failed. Check the deployment logs before retrying. "
             "The database transaction may have been rolled back."
@@ -457,7 +609,6 @@ async def publishquiz(
 
         groups = list_approved_groups(db)
 
-        # Copy primitive values so detached ORM records aren't needed later.
         title = quiz.title
         question_data = [
             {
@@ -645,15 +796,10 @@ async def endquiz(
                 message_id=message_id,
             )
         except TelegramError:
-            # A timed poll may already have closed on Telegram.
-            logger.info(
-                "Poll %s may already be closed",
-                poll_id,
-            )
+            logger.info("Poll %s may already be closed", poll_id)
         except Exception:
             logger.exception(
-                "Unexpected error stopping poll %s",
-                poll_id,
+                "Unexpected error stopping poll %s", poll_id
             )
 
         with SessionLocal() as db:
@@ -680,8 +826,7 @@ async def endquiz(
             finalized_count += 1
         except Exception:
             logger.exception(
-                "Failed to finalize attempt %s",
-                attempt_id,
+                "Failed to finalize attempt %s", attempt_id
             )
 
     try:
@@ -712,6 +857,10 @@ def main() -> None:
     # Register every model before creating missing tables.
     initialize_database()
 
+    # Ensure default subjects exist before accepting quiz imports.
+    with SessionLocal() as db:
+        ensure_default_subjects(db)
+
     app = (
         Application.builder()
         .token(settings.bot_token)
@@ -724,6 +873,11 @@ def main() -> None:
     app.add_handler(CommandHandler("approvegroup", approvegroup))
     app.add_handler(CommandHandler("revokegroup", revokegroup))
     app.add_handler(CommandHandler("groups", groups_command))
+
+    app.add_handler(CommandHandler("subjects", subjects_command))
+    app.add_handler(CommandHandler("addsubject", addsubject_command))
+    app.add_handler(CommandHandler("renamesubject", renamesubject_command))
+    app.add_handler(CommandHandler("deletesubject", deletesubject_command))
 
     app.add_handler(CommandHandler("importquiz", importquiz))
     app.add_handler(CommandHandler("cancelimport", cancelimport))
