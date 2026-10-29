@@ -1,8 +1,11 @@
 
-"""Telegram poll-answer handler for PH Greybot."""
+"""Save Telegram quiz poll answers to participant attempts."""
+
+from __future__ import annotations
 
 import logging
 
+from sqlalchemy import select
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,9 +13,13 @@ from telegram.ext import (
     PollAnswerHandler,
 )
 
-from database import SessionLocal
-from live_poll_service import record_poll_answer
+from database import SessionLocal, QuizAttempt
+from live_poll_service import record_poll_answer, start_attempt
 from poll_registry import get_poll
+from participant_poll_attempt import (
+    get_attempt_id,
+    register_participant_attempt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,55 +28,70 @@ async def handle_poll_answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Persist a Telegram poll answer for the mapped attempt."""
+    item = update.poll_answer
 
-    answer_update = update.poll_answer
-
-    if answer_update is None or answer_update.user is None:
+    if item is None or item.user is None:
         return
 
-    poll_id = str(answer_update.poll_id)
-    user_id = str(answer_update.user.id)
+    poll_id = str(item.poll_id)
+    student_id = str(item.user.id)
 
     try:
         with SessionLocal() as db:
             poll = get_poll(db, poll_id)
 
-            if poll is None:
-                logger.debug("Ignoring unregistered poll %s", poll_id)
+            if poll is None or not poll.open:
                 return
-
-            if not poll.open:
-                logger.debug("Ignoring closed poll %s", poll_id)
-                return
-
-            # Resolve this participant's exact attempt.
-            # The mapping is stored on the database, not inferred from name.
-            from participant_poll_attempt import get_attempt_id
 
             attempt_id = get_attempt_id(
                 db,
                 poll_id=poll_id,
-                student_id=user_id,
+                student_id=student_id,
             )
 
             if attempt_id is None:
-                logger.warning(
-                    "No attempt mapping for poll %s and user %s",
-                    poll_id,
-                    user_id,
+                attempt = db.scalar(
+                    select(QuizAttempt)
+                    .where(
+                        QuizAttempt.quiz_id == poll.quiz_id,
+                        QuizAttempt.student_id == student_id,
+                        QuizAttempt.group_id == str(poll.group_id),
+                        QuizAttempt.status == "in_progress",
+                    )
+                    .order_by(QuizAttempt.id.desc())
                 )
-                return
 
-            option_ids = answer_update.option_ids
+                if attempt is None:
+                    attempt = start_attempt(
+                        db,
+                        quiz_id=poll.quiz_id,
+                        student_id=student_id,
+                        student_name=(
+                            item.user.full_name
+                            or item.user.username
+                            or "Student"
+                        ),
+                        group_id=poll.group_id,
+                    )
 
-            if len(option_ids) == 0:
-                selected_option = None
+                attempt_id = attempt.id
+
+                register_participant_attempt(
+                    db,
+                    poll_id=poll_id,
+                    student_id=student_id,
+                    attempt_id=attempt_id,
+                )
+
+            option_ids = item.option_ids
+
+            if not option_ids:
+                selected = None
             elif len(option_ids) == 1 and option_ids[0] in range(4):
-                selected_option = "ABCD"[option_ids[0]]
+                selected = "ABCD"[option_ids[0]]
             else:
                 logger.warning(
-                    "Unexpected option selection for poll %s",
+                    "Unexpected poll selection for poll %s",
                     poll_id,
                 )
                 return
@@ -78,15 +100,15 @@ async def handle_poll_answer(
                 db,
                 attempt_id=attempt_id,
                 question_id=poll.question_id,
-                selected_option=selected_option,
+                selected_option=selected,
             )
 
     except Exception:
         logger.exception(
-            "Failed to save poll answer for poll %s", poll_id
+            "Failed to save answer for poll %s",
+            poll_id,
         )
 
 
 def install_poll_answer_handler(app: Application) -> None:
-    """Install this handler once on the main bot application."""
     app.add_handler(PollAnswerHandler(handle_poll_answer))
