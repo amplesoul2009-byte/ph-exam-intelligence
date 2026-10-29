@@ -61,7 +61,8 @@ class TestQuizScoring(unittest.TestCase):
     def test_percentile_ties(self):
         scores = [10, 20, 20, 30]
 
-        self.assertEqual(percentile_rank(20, scores), 37.5)
+        # Midrank percentile: half credit for tied scores.
+        self.assertEqual(percentile_rank(20, scores), 50.0)
         self.assertEqual(percentile_rank(30, scores), 87.5)
 
     def test_group_and_overall_percentiles(self):
@@ -72,17 +73,29 @@ class TestQuizScoring(unittest.TestCase):
         )
 
         self.assertEqual(result["overall_percentile"], 50.0)
-        self.assertEqual(result["group_percentile"], 25.0)
+        self.assertEqual(result["group_percentile"], 75.0)
         self.assertTrue(result["provisional"])
 
     def test_rank_order_and_ties(self):
         attempts = [
-            {"student_id": "1", "net_score": 5, "accuracy": 50,
-             "time_used_seconds": 100},
-            {"student_id": "2", "net_score": 8, "accuracy": 70,
-             "time_used_seconds": 120},
-            {"student_id": "3", "net_score": 8, "accuracy": 70,
-             "time_used_seconds": 120},
+            {
+                "student_id": "1",
+                "net_score": 5,
+                "accuracy": 50,
+                "time_used_seconds": 100,
+            },
+            {
+                "student_id": "2",
+                "net_score": 8,
+                "accuracy": 70,
+                "time_used_seconds": 120,
+            },
+            {
+                "student_id": "3",
+                "net_score": 8,
+                "accuracy": 70,
+                "time_used_seconds": 120,
+            },
         ]
 
         ranked = rank_attempts(attempts)
