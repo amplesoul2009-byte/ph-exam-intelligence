@@ -434,6 +434,7 @@ async def addquestions(
     try:
         with SessionLocal() as db:
             quiz = db.get(Quiz, quiz_id)
+
             if quiz is None:
                 await message.reply_text("Quiz not found.")
                 return
@@ -526,7 +527,6 @@ async def receive_import_text(
             )
 
         except (QuizImportError, ValueError) as exc:
-            # Keep append mode active so the owner can retry.
             await message.reply_text(
                 f"Append not completed:\n{str(exc)[:1500]}\n\n"
                 "Your existing saved questions were not intentionally "
@@ -575,7 +575,6 @@ async def receive_import_text(
         )
 
     except (QuizImportError, ValueError) as exc:
-        # Keep pending import state so the owner can correct and retry.
         await message.reply_text(
             f"Import not completed:\n{str(exc)[:1500]}\n\n"
             "Correct the text and send it again, or use /cancelimport."
@@ -679,13 +678,16 @@ async def savedraft(
         with SessionLocal() as db:
             text_content = build_combined_quiz_text(db, quiz_id)
             quiz = db.get(Quiz, quiz_id)
+
             if quiz is None:
                 await message.reply_text("Quiz not found.")
                 return
+
             safe_title = "".join(
                 ch if ch.isalnum() or ch in "-_" else "_"
                 for ch in quiz.title
             ).strip("_")[:60] or "quiz"
+
             filename = f"quiz_{quiz_id}_{safe_title}.txt"
 
         file_buffer = BytesIO(text_content.encode("utf-8"))
@@ -774,66 +776,110 @@ async def approvequiz(
 
     quiz_id = int(context.args[0])
 
-    with SessionLocal() as db:
-        quiz = db.get(Quiz, quiz_id)
+    try:
+        with SessionLocal() as db:
+            quiz = db.get(Quiz, quiz_id)
 
-        if quiz is None:
-            await message.reply_text("Quiz not found.")
-            return
+            if quiz is None:
+                await message.reply_text("Quiz not found.")
+                return
 
-        if quiz.status not in {"draft", "draft_saved", "approved"}:
-            await message.reply_text(
-                "Only an unpublished draft can be approved."
-            )
-            return
+            if quiz.status not in {"draft", "draft_saved", "approved"}:
+                await message.reply_text(
+                    "Only an unpublished draft can be approved."
+                )
+                return
 
-        questions = db.scalars(
-            select(QuizQuestion)
-            .where(QuizQuestion.quiz_id == quiz_id)
-            .order_by(QuizQuestion.position)
-        ).all()
+            # Require the combined-draft review, including every batch.
+            review = review_quiz_draft(db, quiz_id)
 
-        if not questions:
-            await message.reply_text(
-                "Cannot approve a quiz without questions."
-            )
-            return
-
-        invalid_positions = []
-
-        for question in questions:
-            valid_key = (
-                (question.correct_option or "").strip().upper()
-                in {"A", "B", "C", "D"}
-            )
-
-            valid_fields = all(
-                [
-                    (question.question_text or "").strip(),
-                    (question.option_a or "").strip(),
-                    (question.option_b or "").strip(),
-                    (question.option_c or "").strip(),
-                    (question.option_d or "").strip(),
+            if not review["ready_for_owner_review"]:
+                problems = review["problems"]
+                lines = [
+                    "APPROVAL BLOCKED",
+                    "",
+                    f"Quiz ID: {quiz_id}",
+                    f"Questions: {review['question_count']}",
+                    f"Problems found: {len(problems)}",
+                    "",
+                    "Fix these issues and run /reviewquiz again:",
                 ]
-            )
 
-            if not valid_key or not valid_fields:
-                invalid_positions.append(question.position)
+                lines.extend(
+                    f"- {problem}" for problem in problems[:20]
+                )
 
-        if invalid_positions:
-            await message.reply_text(
-                "Approval blocked. Check question(s): "
-                + ", ".join(map(str, invalid_positions))
-            )
-            return
+                if len(problems) > 20:
+                    lines.append(
+                        f"...and {len(problems) - 20} more issue(s)."
+                    )
 
-        quiz.status = "approved"
-        db.commit()
+                lines.extend([
+                    "",
+                    "No approval status was changed.",
+                ])
 
-    await message.reply_text(
-        f"Quiz #{quiz_id} approved.\n"
-        "Ensure you personally checked every answer key and explanation."
-    )
+                await message.reply_text("\n".join(lines)[:4000])
+                return
+
+            questions = db.scalars(
+                select(QuizQuestion)
+                .where(QuizQuestion.quiz_id == quiz_id)
+                .order_by(QuizQuestion.position)
+            ).all()
+
+            if not questions:
+                await message.reply_text(
+                    "Cannot approve a quiz without questions."
+                )
+                return
+
+            # Final direct checks remain as a second safety layer.
+            invalid_positions = []
+
+            for question in questions:
+                valid_key = (
+                    (question.correct_option or "").strip().upper()
+                    in {"A", "B", "C", "D"}
+                )
+
+                valid_fields = all(
+                    [
+                        (question.question_text or "").strip(),
+                        (question.option_a or "").strip(),
+                        (question.option_b or "").strip(),
+                        (question.option_c or "").strip(),
+                        (question.option_d or "").strip(),
+                    ]
+                )
+
+                if not valid_key or not valid_fields:
+                    invalid_positions.append(question.position)
+
+            if invalid_positions:
+                await message.reply_text(
+                    "Approval blocked. Check question(s): "
+                    + ", ".join(map(str, invalid_positions))
+                )
+                return
+
+            quiz.status = "approved"
+            db.commit()
+
+        await message.reply_text(
+            f"Quiz #{quiz_id} approved.\n"
+            "Structural and saved-batch checks passed.\n"
+            "You must still personally verify every question, "
+            "answer key and explanation."
+        )
+
+    except (QuizImportError, ValueError) as exc:
+        await message.reply_text(str(exc)[:1500])
+    except Exception:
+        logger.exception("Quiz approval failed")
+        await message.reply_text(
+            "Quiz approval failed. Check the deployment logs."
+        )
 
 
 # ---------------- QUIZ PUBLISHING ----------------
