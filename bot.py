@@ -1,7 +1,7 @@
 
 """PH Practice Hub / 0xGREY Telegram bot entry point.
 
-Owner-controlled quiz management and subject management.
+Owner-controlled quiz, subject and author workflow management.
 Only owner-approved groups receive quiz polls.
 Participant attempts are created when students answer registered polls.
 """
@@ -9,9 +9,10 @@ Participant attempts are created when students answer registered polls.
 from __future__ import annotations
 
 import logging
+from io import BytesIO
 
 from sqlalchemy import select
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import PollType
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -46,7 +47,11 @@ from poll_answer_handler import install_poll_answer_handler
 from live_poll_service import finalize_attempt
 from quiz_import_service import (
     QuizImportError,
+    append_quiz_batch,
+    build_combined_quiz_text,
     import_quiz_text,
+    mark_draft_saved,
+    review_quiz_draft,
 )
 from leaderboard_publisher import publish_group_leaderboard
 from subjects import (
@@ -64,6 +69,12 @@ logger = logging.getLogger("ph_practice_hub")
 def _message(update: Update):
     return update.effective_message
 
+
+def _valid_id(value: str) -> bool:
+    return value.isdigit() and int(value) > 0
+
+
+# ---------------- BASIC COMMANDS ----------------
 
 async def start(
     update: Update,
@@ -102,18 +113,24 @@ async def help_command(
         "/deletesubject SUBJECT_ID\n\n"
         "OWNER ONLY — QUIZZES:\n"
         "/importquiz TITLE | SUBJECT | LEVEL | YYYY-MM-DD\n"
+        "/addquestions QUIZ_ID\n"
         "/cancelimport\n"
         "/quizzes\n"
+        "/reviewquiz QUIZ_ID\n"
+        "/savedraft QUIZ_ID\n"
         "/approvequiz QUIZ_ID\n"
         "/publishquiz QUIZ_ID\n"
         "/endquiz QUIZ_ID CHAT_ID\n\n"
         "Levels: prelims, mains\n\n"
-        "IMPORT INSTRUCTIONS:\n"
-        "1. Send /importquiz with the quiz details.\n"
-        "2. Send all numbered questions in one message.\n"
-        "3. Review the saved draft and answer keys.\n"
-        "4. Use /approvequiz ID after checking every answer.\n"
-        "5. Use /publishquiz ID to send polls to approved groups.\n\n"
+        "AUTHOR WORKFLOW:\n"
+        "1. Use /importquiz with the quiz details.\n"
+        "2. Send the numbered questions in your next message.\n"
+        "3. Use /addquestions QUIZ_ID to append another batch.\n"
+        "4. Use /reviewquiz QUIZ_ID to validate the draft.\n"
+        "5. Use /savedraft QUIZ_ID to export a TXT copy.\n"
+        "6. Check all questions, options and answer keys yourself.\n"
+        "7. Use /approvequiz QUIZ_ID only after your review.\n"
+        "8. Use /publishquiz QUIZ_ID to publish to approved groups.\n\n"
         "QUESTION FORMAT:\n"
         "1. Question text\n"
         "A. First option\n"
@@ -124,6 +141,8 @@ async def help_command(
         "Explanation: Explanation text"
     )
 
+
+# ---------------- GROUP MANAGEMENT ----------------
 
 async def approvegroup(
     update: Update,
@@ -169,14 +188,20 @@ async def revokegroup(
         await message.reply_text("Usage: /revokegroup CHAT_ID")
         return
 
-    with SessionLocal() as db:
-        changed = revoke_group(db, context.args[0])
+    try:
+        with SessionLocal() as db:
+            changed = revoke_group(db, context.args[0])
 
-    await message.reply_text(
-        "Group access revoked."
-        if changed
-        else "Group is not active or was not found."
-    )
+        await message.reply_text(
+            "Group access revoked."
+            if changed
+            else "Group is not active or was not found."
+        )
+    except Exception:
+        logger.exception("Failed to revoke group")
+        await message.reply_text(
+            "Could not revoke group. Check the logs."
+        )
 
 
 async def groups_command(
@@ -347,7 +372,7 @@ async def deletesubject_command(
         )
 
 
-# ---------------- QUIZ IMPORT ----------------
+# ---------------- QUIZ IMPORT AND APPEND ----------------
 
 async def importquiz(
     update: Update,
@@ -374,6 +399,8 @@ async def importquiz(
 
     title, subject, level, quiz_date = parts
 
+    # One pending operation at a time for this owner.
+    context.user_data.pop("pending_quiz_append", None)
     context.user_data["pending_quiz_import"] = {
         "title": title,
         "subject": subject,
@@ -383,9 +410,58 @@ async def importquiz(
 
     await message.reply_text(
         "Send the complete numbered questions in your next message.\n\n"
-        "This creates a draft only. It will not publish automatically.\n"
+        "This creates an unpublished draft only.\n"
         "Use /cancelimport if you want to cancel."
     )
+
+
+async def addquestions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if len(context.args) != 1 or not _valid_id(context.args[0]):
+        await message.reply_text(
+            "Usage: /addquestions QUIZ_ID"
+        )
+        return
+
+    quiz_id = int(context.args[0])
+
+    try:
+        with SessionLocal() as db:
+            quiz = db.get(Quiz, quiz_id)
+            if quiz is None:
+                await message.reply_text("Quiz not found.")
+                return
+
+            if quiz.status not in {"draft", "draft_saved"}:
+                await message.reply_text(
+                    "Questions can only be added to an unpublished draft."
+                )
+                return
+
+        context.user_data.pop("pending_quiz_import", None)
+        context.user_data["pending_quiz_append"] = {
+            "quiz_id": quiz_id,
+        }
+
+        await message.reply_text(
+            f"Ready to append questions to draft #{quiz_id}.\n"
+            "Send the next numbered question batch as a text message.\n"
+            "Existing questions will be preserved.\n"
+            "The quiz remains unpublished.\n"
+            "Use /cancelimport to cancel this pending operation."
+        )
+
+    except Exception:
+        logger.exception("Could not prepare question append")
+        await message.reply_text(
+            "Could not prepare the append operation. Check the logs."
+        )
 
 
 async def cancelimport(
@@ -397,7 +473,12 @@ async def cancelimport(
         return
 
     context.user_data.pop("pending_quiz_import", None)
-    await message.reply_text("Pending quiz import cancelled.")
+    context.user_data.pop("pending_quiz_append", None)
+
+    await message.reply_text(
+        "Pending import or append operation cancelled. "
+        "Previously saved drafts and questions were not deleted."
+    )
 
 
 async def receive_import_text(
@@ -409,13 +490,60 @@ async def receive_import_text(
     if not message or not message.text:
         return
 
-    if "pending_quiz_import" not in context.user_data:
-        return
-
     if not await owner_only(update, context):
         return
 
-    pending = context.user_data["pending_quiz_import"]
+    pending_append = context.user_data.get("pending_quiz_append")
+    pending_import = context.user_data.get("pending_quiz_import")
+
+    if not pending_append and not pending_import:
+        return
+
+    # APPEND MODE
+    if pending_append:
+        quiz_id = pending_append["quiz_id"]
+
+        try:
+            with SessionLocal() as db:
+                result = append_quiz_batch(
+                    db,
+                    quiz_id=quiz_id,
+                    text=message.text,
+                    max_questions=200,
+                )
+
+            # Clear pending state only after a successful append.
+            context.user_data.pop("pending_quiz_append", None)
+
+            await message.reply_text(
+                "QUESTION BATCH APPENDED\n\n"
+                f"Quiz ID: {result['quiz_id']}\n"
+                f"Questions added: {result['added_questions']}\n"
+                f"Total questions: {result['total_questions']}\n"
+                "Status: unpublished draft\n\n"
+                f"Use /reviewquiz {quiz_id} to validate the draft.\n"
+                f"Use /savedraft {quiz_id} to export a TXT copy."
+            )
+
+        except (QuizImportError, ValueError) as exc:
+            # Keep append mode active so the owner can retry.
+            await message.reply_text(
+                f"Append not completed:\n{str(exc)[:1500]}\n\n"
+                "Your existing saved questions were not intentionally "
+                "replaced. Correct the batch and send it again, or "
+                "use /cancelimport."
+            )
+        except Exception:
+            logger.exception("Question append failed")
+            await message.reply_text(
+                "Append failed. Check deployment logs before retrying. "
+                "The existing draft should be checked before another attempt."
+            )
+
+        return
+
+    # NEW IMPORT MODE
+    pending = pending_import
 
     try:
         settings = load_settings()
@@ -441,10 +569,13 @@ async def receive_import_text(
             f"Questions detected: {result['detected_questions']}\n"
             f"Analysis status: {result['analysis_status']}\n\n"
             "Review every question, option, answer key and explanation.\n"
-            f"Then use /approvequiz {result['quiz_id']}."
+            f"Use /reviewquiz {result['quiz_id']} to check the draft.\n"
+            f"Use /savedraft {result['quiz_id']} to export a TXT copy.\n"
+            "Approval and publishing are separate owner actions."
         )
 
     except (QuizImportError, ValueError) as exc:
+        # Keep pending import state so the owner can correct and retry.
         await message.reply_text(
             f"Import not completed:\n{str(exc)[:1500]}\n\n"
             "Correct the text and send it again, or use /cancelimport."
@@ -453,8 +584,138 @@ async def receive_import_text(
     except Exception:
         logger.exception("Quiz import failed")
         await message.reply_text(
-            "The import failed. Check the deployment logs before retrying. "
-            "The database transaction may have been rolled back."
+            "The import failed. Check the deployment logs before retrying."
+        )
+
+
+# ---------------- DRAFT REVIEW AND EXPORT ----------------
+
+async def reviewquiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if len(context.args) != 1 or not _valid_id(context.args[0]):
+        await message.reply_text("Usage: /reviewquiz QUIZ_ID")
+        return
+
+    quiz_id = int(context.args[0])
+
+    try:
+        with SessionLocal() as db:
+            report = review_quiz_draft(db, quiz_id)
+
+        problems = report["problems"]
+        lines = [
+            "DRAFT REVIEW",
+            "",
+            f"Quiz ID: {report['quiz_id']}",
+            f"Title: {report['title']}",
+            f"Status: {report['status']}",
+            f"Questions: {report['question_count']}",
+            f"Import batches: {report['batch_count']}",
+            f"Within 200-question limit: "
+            f"{'Yes' if report['within_limit'] else 'No'}",
+            "",
+        ]
+
+        if problems:
+            lines.append(f"Problems found: {len(problems)}")
+            lines.extend(f"- {item}" for item in problems[:25])
+
+            if len(problems) > 25:
+                lines.append(
+                    f"...and {len(problems) - 25} more. "
+                    "Fix the issues and review again."
+                )
+        elif report["ready_for_owner_review"]:
+            lines.append(
+                "Structural checks passed. Manually verify every "
+                "question, option, answer key and explanation."
+            )
+        else:
+            lines.append(
+                "Draft is not ready for owner review. "
+                "Check the question count."
+            )
+
+        lines.extend(
+            [
+                "",
+                "This command does not approve or publish the quiz.",
+            ]
+        )
+
+        await message.reply_text("\n".join(lines)[:4000])
+
+    except (QuizImportError, ValueError) as exc:
+        await message.reply_text(str(exc)[:1500])
+    except Exception:
+        logger.exception("Draft review failed")
+        await message.reply_text(
+            "Draft review failed. Check deployment logs."
+        )
+
+
+async def savedraft(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if len(context.args) != 1 or not _valid_id(context.args[0]):
+        await message.reply_text("Usage: /savedraft QUIZ_ID")
+        return
+
+    quiz_id = int(context.args[0])
+
+    try:
+        # Build the TXT before changing the draft's status.
+        with SessionLocal() as db:
+            text_content = build_combined_quiz_text(db, quiz_id)
+            quiz = db.get(Quiz, quiz_id)
+            if quiz is None:
+                await message.reply_text("Quiz not found.")
+                return
+            safe_title = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_"
+                for ch in quiz.title
+            ).strip("_")[:60] or "quiz"
+            filename = f"quiz_{quiz_id}_{safe_title}.txt"
+
+        file_buffer = BytesIO(text_content.encode("utf-8"))
+        file_buffer.seek(0)
+
+        await message.reply_document(
+            document=InputFile(file_buffer, filename=filename),
+            caption=(
+                f"Draft export for quiz #{quiz_id}.\n"
+                "This file is a copy; it does not approve or publish the quiz."
+            ),
+        )
+
+        # Mark saved only after Telegram accepts the document send.
+        with SessionLocal() as db:
+            result = mark_draft_saved(db, quiz_id)
+
+        await message.reply_text(
+            f"Draft #{quiz_id} saved.\n"
+            f"Questions exported: {result['question_count']}\n"
+            "The quiz remains unpublished."
+        )
+
+    except (QuizImportError, ValueError) as exc:
+        await message.reply_text(str(exc)[:1500])
+    except Exception:
+        logger.exception("Draft export failed")
+        await message.reply_text(
+            "Could not export or mark this draft as saved. "
+            "Check deployment logs before retrying."
         )
 
 
@@ -497,6 +758,8 @@ async def quizzes_command(
     await message.reply_text("\n".join(lines)[:4000])
 
 
+# ---------------- QUIZ APPROVAL ----------------
+
 async def approvequiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -505,7 +768,7 @@ async def approvequiz(
     if not message or not await owner_only(update, context):
         return
 
-    if not context.args or not context.args[0].isdigit():
+    if len(context.args) != 1 or not _valid_id(context.args[0]):
         await message.reply_text("Usage: /approvequiz QUIZ_ID")
         return
 
@@ -516,6 +779,12 @@ async def approvequiz(
 
         if quiz is None:
             await message.reply_text("Quiz not found.")
+            return
+
+        if quiz.status not in {"draft", "draft_saved", "approved"}:
+            await message.reply_text(
+                "Only an unpublished draft can be approved."
+            )
             return
 
         questions = db.scalars(
@@ -540,11 +809,11 @@ async def approvequiz(
 
             valid_fields = all(
                 [
-                    question.question_text.strip(),
-                    question.option_a.strip(),
-                    question.option_b.strip(),
-                    question.option_c.strip(),
-                    question.option_d.strip(),
+                    (question.question_text or "").strip(),
+                    (question.option_a or "").strip(),
+                    (question.option_b or "").strip(),
+                    (question.option_c or "").strip(),
+                    (question.option_d or "").strip(),
                 ]
             )
 
@@ -563,10 +832,11 @@ async def approvequiz(
 
     await message.reply_text(
         f"Quiz #{quiz_id} approved.\n"
-        "Ensure you personally checked the supplied answer keys "
-        "and explanations before publishing."
+        "Ensure you personally checked every answer key and explanation."
     )
 
+
+# ---------------- QUIZ PUBLISHING ----------------
 
 async def _group_is_approved(chat_id: str | int) -> bool:
     with SessionLocal() as db:
@@ -581,7 +851,7 @@ async def publishquiz(
     if not message or not await owner_only(update, context):
         return
 
-    if not context.args or not context.args[0].isdigit():
+    if len(context.args) != 1 or not _valid_id(context.args[0]):
         await message.reply_text("Usage: /publishquiz QUIZ_ID")
         return
 
@@ -647,6 +917,7 @@ async def publishquiz(
     for group in groups:
         chat_id_text = str(group["chat_id"])
 
+        # Recheck allowlist immediately before publishing to each group.
         if not await _group_is_approved(chat_id_text):
             logger.warning(
                 "Skipped revoked group %s during publication",
@@ -745,6 +1016,8 @@ async def publishquiz(
     )
 
 
+# ---------------- QUIZ END AND LEADERBOARD ----------------
+
 async def endquiz(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -755,12 +1028,10 @@ async def endquiz(
 
     if (
         len(context.args) != 2
-        or not context.args[0].isdigit()
+        or not _valid_id(context.args[0])
         or not context.args[1].lstrip("-").isdigit()
     ):
-        await message.reply_text(
-            "Usage: /endquiz QUIZ_ID CHAT_ID"
-        )
+        await message.reply_text("Usage: /endquiz QUIZ_ID CHAT_ID")
         return
 
     quiz_id = int(context.args[0])
@@ -851,6 +1122,8 @@ async def endquiz(
     )
 
 
+# ---------------- APPLICATION ENTRY POINT ----------------
+
 def main() -> None:
     settings = load_settings()
 
@@ -880,8 +1153,11 @@ def main() -> None:
     app.add_handler(CommandHandler("deletesubject", deletesubject_command))
 
     app.add_handler(CommandHandler("importquiz", importquiz))
+    app.add_handler(CommandHandler("addquestions", addquestions))
     app.add_handler(CommandHandler("cancelimport", cancelimport))
     app.add_handler(CommandHandler("quizzes", quizzes_command))
+    app.add_handler(CommandHandler("reviewquiz", reviewquiz))
+    app.add_handler(CommandHandler("savedraft", savedraft))
     app.add_handler(CommandHandler("approvequiz", approvequiz))
     app.add_handler(CommandHandler("publishquiz", publishquiz))
     app.add_handler(CommandHandler("endquiz", endquiz))
