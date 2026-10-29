@@ -166,7 +166,8 @@ def import_quiz_text(
         title=title,
         subject=subject,
         level=level,
-        quiz_date=parsed_date,
+        # Database schema stores quiz_date as String(20).
+        quiz_date=parsed_date.isoformat(),
         status="draft",
         question_count=len(parsed.questions),
     )
@@ -189,6 +190,7 @@ def import_quiz_text(
         db.flush()
 
         question_records = []
+
         for position, question in enumerate(parsed.questions, start=1):
             record = _question_record(
                 quiz_id=quiz.id,
@@ -206,9 +208,12 @@ def import_quiz_text(
             report = analyze_import(parsed, settings)
 
             if not isinstance(report, dict):
-                raise ValueError("Quiz analyzer returned an invalid report.")
+                raise ValueError(
+                    "Quiz analyzer returned an invalid report."
+                )
 
             analyses = report.get("questions", [])
+
             if not isinstance(analyses, list):
                 raise ValueError(
                     "Quiz analyzer returned an invalid questions list."
@@ -234,6 +239,7 @@ def import_quiz_text(
                 review_status = analysis.get(
                     "review_status", "needs_review"
                 )
+
                 allowed_statuses = {
                     "pending",
                     "needs_review",
@@ -245,7 +251,7 @@ def import_quiz_text(
                 if review_status not in allowed_statuses:
                     review_status = "needs_review"
 
-                # An automated analysis must never approve a question.
+                # AI must never grant owner approval.
                 if review_status == "approved":
                     review_status = "pending_owner_approval"
 
@@ -268,7 +274,7 @@ def import_quiz_text(
             )
 
         except Exception as exc:
-            # Preserve parsed questions even if the optional analysis fails.
+            # Keep parsed questions if optional analysis fails.
             batch.status = "analysis_failed"
             batch.accepted_count = len(parsed.questions)
             batch.warning_count = (
@@ -291,7 +297,9 @@ def import_quiz_text(
                 record.analysis_report = json.dumps(
                     {
                         "status": "needs_review",
-                        "message": "Analysis did not complete successfully.",
+                        "message": (
+                            "Analysis did not complete successfully."
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -324,11 +332,7 @@ def append_quiz_batch(
     text: str,
     max_questions: int = MAX_QUIZ_QUESTIONS,
 ) -> dict:
-    """Append one numbered batch to an existing unpublished draft.
-
-    Each appended batch is stored in ImportBatch, while its questions
-    are inserted into the same quiz with continuous question positions.
-    """
+    """Append a numbered batch to an existing unpublished draft."""
     _validate_import_text(text)
     _validate_question_limit(max_questions)
 
@@ -364,6 +368,7 @@ def append_quiz_batch(
         )
 
         incoming_count = len(parsed.questions)
+
         if existing_count + incoming_count > MAX_QUIZ_QUESTIONS:
             raise QuizImportError(
                 "This batch would exceed the 200-question limit. "
@@ -384,9 +389,7 @@ def append_quiz_batch(
                     "source": "appended_text_batch",
                     "parser_errors": parsed.errors,
                     "parser_warnings": parsed.warnings,
-                    "message": (
-                        "Appended questions require owner review."
-                    ),
+                    "message": "Appended questions require owner review.",
                 },
                 ensure_ascii=False,
             ),
@@ -425,8 +428,9 @@ def append_quiz_batch(
 
 
 def review_quiz_draft(db: Session, quiz_id: int) -> dict:
-    """Check the combined draft without approving or publishing it."""
+    """Validate a draft without approving or publishing it."""
     quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+
     if quiz is None:
         raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
 
@@ -445,6 +449,7 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
             problems.append(
                 f"Duplicate question position: {question.position}"
             )
+
         seen_positions.add(question.position)
 
         if question.position != expected_position:
@@ -472,6 +477,7 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
                 )
 
         answer = (question.correct_option or "").strip().upper()
+
         if answer not in {"A", "B", "C", "D"}:
             problems.append(
                 f"Question {expected_position}: answer must be A, B, C, or D."
@@ -501,8 +507,9 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
 
 
 def build_combined_quiz_text(db: Session, quiz_id: int) -> str:
-    """Build one TXT document from every batch in question order."""
+    """Build one TXT document from every question in position order."""
     quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+
     if quiz is None:
         raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
 
@@ -556,8 +563,9 @@ def build_combined_quiz_text(db: Session, quiz_id: int) -> str:
 
 
 def mark_draft_saved(db: Session, quiz_id: int) -> dict:
-    """Mark a reviewed draft as saved, but do not approve or publish it."""
+    """Mark a draft as saved without approving or publishing it."""
     quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+
     if quiz is None:
         raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
 
