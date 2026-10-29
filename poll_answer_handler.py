@@ -23,6 +23,24 @@ from poll_registry import get_poll
 logger = logging.getLogger(__name__)
 
 
+def _original_option(
+    displayed_index: int,
+    option_order: str,
+) -> str | None:
+    """Translate Telegram's displayed option index to original A/B/C/D."""
+
+    option_order = (option_order or "ABCD").strip().upper()
+
+    if len(option_order) != 4 or set(option_order) != set("ABCD"):
+        logger.error("Invalid stored poll option mapping: %r", option_order)
+        return None
+
+    if not 0 <= displayed_index < 4:
+        return None
+
+    return option_order[displayed_index]
+
+
 async def handle_poll_answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -92,16 +110,23 @@ async def handle_poll_answer(
                     attempt_id=attempt_id,
                 )
 
-            # Telegram quiz polls use option indexes 0 through 3.
+            # Telegram reports the selected displayed option index.
             option_ids = answer.option_ids
 
             if not option_ids:
                 selected_option = None
-            elif (
-                len(option_ids) == 1
-                and 0 <= option_ids[0] <= 3
-            ):
-                selected_option = "ABCD"[option_ids[0]]
+            elif len(option_ids) == 1:
+                selected_option = _original_option(
+                    option_ids[0],
+                    poll.option_order,
+                )
+
+                if selected_option is None:
+                    logger.warning(
+                        "Invalid option selection or mapping for poll %s",
+                        poll_id,
+                    )
+                    return
             else:
                 logger.warning(
                     "Unexpected option selection for poll %s",
