@@ -1,306 +1,537 @@
 
-"""Leaderboard rendering and ranking service for PH Greybot."""
+"""Leaderboard calculations for PH Greybot / PH Practice Hub.
+
+Scoring:
+    Correct answer: +1
+    Wrong answer:   -0.25
+    Unanswered:      0
+
+Percentiles are calculated from attempts belonging to the same quiz.
+The master leaderboard uses each student's best completed attempt.
+"""
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from html import escape
+from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
-from database import AttemptAnswer, Quiz, QuizAttempt, QuizQuestion
-from quiz_scoring import (
-    calculate_live_percentiles,
-    calculate_score,
-    format_time,
+from database import (
+    AttemptAnswer,
+    Quiz,
+    QuizAttempt,
+    QuizQuestion,
 )
 
 
-def _student_name(name: str | None, student_id: str) -> str:
-    name = (name or "").strip()
-    return escape(name or f"Student {student_id}")
+def _utc_datetime(value: datetime | None) -> datetime:
+    """Normalize timestamps for duration calculations."""
+    if value is None:
+        return datetime.now(timezone.utc)
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
 
 
-def _attempt_time(attempt: QuizAttempt) -> int:
-    """Calculate elapsed seconds, including completed attempts."""
-    if not attempt.started_at:
-        return 0
-
-    end = attempt.submitted_at
-
-    if end is None:
-        from datetime import datetime, timezone
-        end = datetime.now(timezone.utc)
-
-    start = attempt.started_at
-
-    # SQLite may return naive datetimes even for timezone-aware columns.
-    if start.tzinfo is None:
-        from datetime import timezone
-        start = start.replace(tzinfo=timezone.utc)
-
-    if end.tzinfo is None:
-        from datetime import timezone
-        end = end.replace(tzinfo=timezone.utc)
-
+def _time_used(attempt: QuizAttempt) -> int:
+    start = _utc_datetime(attempt.started_at)
+    end = _utc_datetime(
+        attempt.submitted_at
+        or datetime.now(timezone.utc)
+    )
     return max(0, int((end - start).total_seconds()))
+
+
+def _percentile(score: float, population: list[float]) -> float:
+    """Midrank percentile, from 0 to 100."""
+    if not population:
+        return 0.0
+
+    below = sum(value < score for value in population)
+    tied = sum(value == score for value in population)
+
+    return round(
+        ((below + 0.5 * tied) / len(population)) * 100,
+        2,
+    )
 
 
 def _score_attempt(
     attempt: QuizAttempt,
     questions: list[QuizQuestion],
-) -> dict:
-    """Recalculate scores from saved answers rather than trusting stored totals."""
+    answers_by_question: dict[int, AttemptAnswer],
+) -> dict[str, Any]:
+    """Recalculate an attempt from stored answers and approved answer keys."""
 
-    answer_map = {
-        answer.question_id: answer
-        for answer in attempt.answers
-    }
-
+    total_questions = len(questions)
     correct = 0
     wrong = 0
+    unanswered = 0
+    attempted = 0
+    score = 0.0
+    maximum_score = sum(float(q.marks or 1.0) for q in questions)
+
+    missing_keys = [
+        q.position
+        for q in questions
+        if (q.correct_option or "").strip().upper()
+        not in {"A", "B", "C", "D"}
+    ]
+
+    scoring_valid = not missing_keys
 
     for question in questions:
-        answer = answer_map.get(question.id)
+        answer = answers_by_question.get(question.id)
+        selected = (
+            (answer.selected_option or "").strip().upper()
+            if answer
+            else ""
+        )
 
-        if answer is None or answer.selected_option is None:
+        if selected not in {"A", "B", "C", "D"}:
+            unanswered += 1
             continue
 
-        if question.correct_option is None:
-            # Do not count answers against an unapproved/missing answer key.
+        attempted += 1
+
+        correct_option = (
+            (question.correct_option or "").strip().upper()
+        )
+
+        # Never publish an apparently valid score with a missing key.
+        if correct_option not in {"A", "B", "C", "D"}:
             continue
 
-        if answer.selected_option.upper() == question.correct_option.upper():
+        if selected == correct_option:
             correct += 1
+            score += float(question.marks or 1.0)
         else:
             wrong += 1
+            score -= float(question.negative_marks or 0.0)
 
-    unanswered = max(0, len(questions) - correct - wrong)
+    accuracy = (
+        round((correct / attempted) * 100, 2)
+        if attempted
+        else 0.0
+    )
 
-    scorecard = calculate_score(
-        total_questions=len(questions),
-        correct=correct,
-        wrong=wrong,
-        unanswered=unanswered,
-        marks_per_correct=1.0,
-        negative_marks=0.25,
-        time_used_seconds=_attempt_time(attempt),
+    score_percentage = (
+        round((score / maximum_score) * 100, 2)
+        if maximum_score > 0
+        else 0.0
     )
 
     return {
-        **scorecard.to_dict(),
         "attempt_id": attempt.id,
         "quiz_id": attempt.quiz_id,
-        "student_id": attempt.student_id,
-        "student_name": attempt.student_name,
-        "group_id": attempt.group_id,
+        "student_id": str(attempt.student_id),
+        "student_name": attempt.student_name or "Student",
+        "group_id": (
+            str(attempt.group_id)
+            if attempt.group_id is not None
+            else None
+        ),
+        "score": round(score, 2),
+        "net_score": round(score, 2),
+        "maximum_score": round(maximum_score, 2),
+        "total_questions": total_questions,
+        "score_percentage": score_percentage,
+        "accuracy": accuracy,
+        "correct_count": correct,
+        "wrong_count": wrong,
+        "unanswered_count": unanswered,
+        "attempted_count": attempted,
+        "time_used_seconds": _time_used(attempt),
         "status": attempt.status,
+        "submitted_at": attempt.submitted_at,
+        "overall_percentile": 0.0,
+        "group_percentile": 0.0,
+        "rank": None,
+        "scoring_valid": scoring_valid,
+        "missing_answer_keys": missing_keys,
     }
 
 
-def _load_attempts(
-    db: Session,
-    quiz_id: int,
-    group_id: str | int | None = None,
-) -> tuple[Quiz, list[dict]]:
-    quiz = db.scalar(
-        select(Quiz)
-        .where(Quiz.id == quiz_id)
-        .options(selectinload(Quiz.questions))
+def _rank_rows(
+    rows: list[dict[str, Any]],
+    percentile_population: list[float] | None = None,
+    group_population: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Assign ranks and percentiles without changing the input list."""
+    ranked = [dict(row) for row in rows]
+
+    ranked.sort(
+        key=lambda row: (
+            not row["scoring_valid"],
+            -row["score"],
+            -row["accuracy"],
+            row["time_used_seconds"],
+            row["attempt_id"],
+        )
     )
 
-    if quiz is None:
-        raise ValueError(f"Quiz {quiz_id} was not found.")
-
-    statement = (
-        select(QuizAttempt)
-        .where(QuizAttempt.quiz_id == quiz_id)
-        .options(selectinload(QuizAttempt.answers))
+    valid_population = (
+        percentile_population
+        if percentile_population is not None
+        else [
+            row["score"]
+            for row in ranked
+            if row["scoring_valid"]
+        ]
     )
 
-    if group_id is not None:
-        statement = statement.where(
-            QuizAttempt.group_id == str(group_id)
+    valid_group_population = (
+        group_population
+        if group_population is not None
+        else [
+            row["score"]
+            for row in ranked
+            if row["scoring_valid"]
+        ]
+    )
+
+    previous_key = None
+    competition_rank = 0
+
+    for index, row in enumerate(ranked, start=1):
+        if not row["scoring_valid"]:
+            row["rank"] = None
+            row["overall_percentile"] = 0.0
+            row["group_percentile"] = 0.0
+            continue
+
+        tie_key = (
+            row["score"],
+            row["accuracy"],
+            row["time_used_seconds"],
         )
 
-    attempts = db.scalars(statement).all()
+        if tie_key != previous_key:
+            competition_rank = index
+            previous_key = tie_key
 
-    results = [
-        _score_attempt(attempt, quiz.questions)
-        for attempt in attempts
-    ]
+        row["rank"] = competition_rank
+        row["overall_percentile"] = _percentile(
+            row["score"], valid_population
+        )
+        row["group_percentile"] = _percentile(
+            row["score"], valid_group_population
+        )
 
-    return quiz, results
+    return ranked
 
 
-def _percentile_for_attempt(
-    attempt: dict,
-    population: list[dict],
-) -> float:
-    scores = [
-        row["net_score"]
-        for row in population
-        if row["attempt_id"] != attempt["attempt_id"]
-        or row["student_id"] == attempt["student_id"]
-    ]
+def _best_completed_attempts(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one best completed attempt per Telegram user ID."""
+    best_by_student: dict[str, dict[str, Any]] = {}
 
-    result = calculate_live_percentiles(
-        student_score=attempt["net_score"],
-        overall_scores=scores,
-        group_scores=scores,
-    )
+    for row in rows:
+        if row["status"] not in {"submitted", "completed", "finalized"}:
+            continue
 
-    return result["overall_percentile"]
+        if not row["scoring_valid"]:
+            continue
+
+        student_id = row["student_id"]
+        existing = best_by_student.get(student_id)
+
+        candidate_key = (
+            row["score"],
+            row["accuracy"],
+            -row["time_used_seconds"],
+        )
+
+        if existing is None:
+            best_by_student[student_id] = row
+            continue
+
+        existing_key = (
+            existing["score"],
+            existing["accuracy"],
+            -existing["time_used_seconds"],
+        )
+
+        if candidate_key > existing_key:
+            best_by_student[student_id] = row
+
+    return list(best_by_student.values())
 
 
 def build_leaderboard(
     db: Session,
-    *,
     quiz_id: int,
     group_id: str | int,
     current_attempt_id: int | None = None,
-) -> dict:
-    """Build a group board and same-quiz overall board.
+) -> dict[str, Any]:
+    """Build group, live overall, and master leaderboard data.
 
-    Overall comparisons include attempts across groups. Each attempt remains
-    independently recorded; repeated attempts are not deleted or overwritten.
+    Overall percentile:
+        All valid attempts for this quiz across all groups.
+
+    Group percentile:
+        Valid attempts for this quiz in the requested group.
+
+    Master leaderboard:
+        Best completed attempt per student across all groups.
     """
+    quiz = db.get(Quiz, quiz_id)
 
-    quiz, all_attempts = _load_attempts(db, quiz_id)
-    group_id = str(group_id)
+    if quiz is None:
+        raise ValueError(f"Quiz {quiz_id} does not exist.")
 
-    group_attempts = [
-        row for row in all_attempts
-        if row["group_id"] == group_id
-    ]
+    questions = list(
+        db.scalars(
+            select(QuizQuestion)
+            .where(QuizQuestion.quiz_id == quiz_id)
+            .order_by(QuizQuestion.position)
+        ).all()
+    )
 
-    # Only submitted/completed attempts are included in the final master board.
-    completed_overall = [
-        row for row in all_attempts
-        if row["status"] in {"submitted", "completed", "finalized"}
-    ]
+    attempts = list(
+        db.scalars(
+            select(QuizAttempt)
+            .where(QuizAttempt.quiz_id == quiz_id)
+        ).all()
+    )
 
-    live_overall = [
-        row for row in all_attempts
-        if row["status"] in {
-            "in_progress", "submitted", "completed", "finalized"
-        }
-    ]
+    attempt_ids = [attempt.id for attempt in attempts]
 
-    def rank_key(row):
-        return (
-            -row["net_score"],
-            -row["accuracy"],
-            row["time_used_seconds"],
+    answers_by_attempt: dict[int, dict[int, AttemptAnswer]] = defaultdict(dict)
+
+    if attempt_ids:
+        answers = db.scalars(
+            select(AttemptAnswer).where(
+                AttemptAnswer.attempt_id.in_(attempt_ids)
+            )
+        ).all()
+
+        for answer in answers:
+            answers_by_attempt[answer.attempt_id][
+                answer.question_id
+            ] = answer
+
+    all_rows = [
+        _score_attempt(
+            attempt,
+            questions,
+            answers_by_attempt[attempt.id],
         )
+        for attempt in attempts
+    ]
 
-    group_ranked = sorted(group_attempts, key=rank_key)
-    overall_ranked = sorted(completed_overall, key=rank_key)
+    valid_overall_scores = [
+        row["score"]
+        for row in all_rows
+        if row["scoring_valid"]
+    ]
 
-    # The group percentile is measured against all currently recorded
-    # attempts in this group. The overall percentile spans approved groups.
+    target_group = str(group_id)
+
+    group_rows = [
+        row
+        for row in all_rows
+        if row["group_id"] == target_group
+    ]
+
+    valid_group_scores = [
+        row["score"]
+        for row in group_rows
+        if row["scoring_valid"]
+    ]
+
+    overall_ranked = _rank_rows(
+        all_rows,
+        percentile_population=valid_overall_scores,
+        group_population=valid_overall_scores,
+    )
+
+    group_ranked = _rank_rows(
+        group_rows,
+        percentile_population=valid_overall_scores,
+        group_population=valid_group_scores,
+    )
+
+    overall_by_attempt = {
+        row["attempt_id"]: row
+        for row in overall_ranked
+    }
+
+    # Ensure group rows retain their quiz-wide percentile and their
+    # within-group percentile.
+    group_attempts = []
     for row in group_ranked:
-        row["group_percentile"] = _percentile_for_attempt(
-            row, group_attempts
-        )
+        merged = dict(row)
+        overall_row = overall_by_attempt.get(row["attempt_id"])
 
-    for row in live_overall:
-        row["overall_percentile"] = _percentile_for_attempt(
-            row, live_overall
-        )
+        if overall_row:
+            merged["overall_percentile"] = (
+                overall_row["overall_percentile"]
+            )
 
-    # Optional best-attempt view: one best completed attempt per student.
-    best_by_student = {}
-    for row in overall_ranked:
-        key = row["student_id"]
-        existing = best_by_student.get(key)
-        if existing is None or rank_key(row) < rank_key(existing):
-            best_by_student[key] = row
+        group_attempts.append(merged)
 
-    master_best = sorted(best_by_student.values(), key=rank_key)
+    master_candidates = _best_completed_attempts(all_rows)
+
+    master_best_attempts = _rank_rows(
+        master_candidates,
+        percentile_population=[
+            row["score"]
+            for row in master_candidates
+        ],
+        group_population=[
+            row["score"]
+            for row in master_candidates
+        ],
+    )
+
+    current_attempt = next(
+        (
+            row
+            for row in group_attempts
+            if row["attempt_id"] == current_attempt_id
+        ),
+        None,
+    )
 
     return {
         "quiz_id": quiz.id,
-        "title": quiz.title,
-        "total_questions": len(quiz.questions),
-        "group_id": group_id,
-        "group_attempts": group_ranked,
-        "overall_attempts": sorted(live_overall, key=rank_key),
-        "master_best_attempts": master_best,
+        "quiz_title": quiz.title,
+        "subject": quiz.subject,
+        "total_questions": len(questions),
+        "group_id": target_group,
+        "group_attempts": group_attempts,
+        "overall_attempts": overall_ranked,
+        "master_best_attempts": master_best_attempts,
         "current_attempt_id": current_attempt_id,
+        "current_attempt": current_attempt,
         "provisional": any(
             row["status"] == "in_progress"
-            for row in live_overall
+            for row in all_rows
+        ),
+        "scoring_valid": all(
+            row["scoring_valid"] for row in all_rows
+        ),
+        "missing_answer_keys": sorted(
+            {
+                position
+                for row in all_rows
+                for position in row["missing_answer_keys"]
+            }
         ),
     }
 
 
+def _format_time(seconds: int) -> str:
+    minutes, remaining_seconds = divmod(max(0, seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+
+    return f"{minutes}:{remaining_seconds:02d}"
+
+
 def render_group_leaderboard(
-    data: dict,
-    *,
+    data: dict[str, Any],
     limit: int = 30,
 ) -> str:
-    """Render the requested PH-style leaderboard for a Telegram group."""
+    """Render the group leaderboard as Telegram-compatible HTML."""
+    quiz_title = escape(str(data.get("quiz_title", "Quiz")))
+    group_id = escape(str(data.get("group_id", "Unknown")))
+    total_questions = int(data.get("total_questions", 0))
 
-    total = data["total_questions"]
-    group_id = escape(str(data["group_id"]))
-    title = escape(data["title"])
-    rows = data["group_attempts"][:limit]
-    overall = data["overall_attempts"]
+    rows = data.get("group_attempts", [])
+    valid_rows = [
+        row for row in rows if row.get("scoring_valid", False)
+    ]
 
-    medals = ["🥇", "🥈", "🥉"]
+    valid_rows.sort(
+        key=lambda row: (
+            row.get("rank") is None,
+            row.get("rank") or 10**9,
+            -row.get("score", 0.0),
+        )
+    )
+
+    if not data.get("scoring_valid", True):
+        positions = ", ".join(
+            str(position)
+            for position in data.get("missing_answer_keys", [])
+        )
+        return (
+            "⚠️ <b>LEADERBOARD NOT READY</b>\n"
+            f"<b>Quiz:</b> {quiz_title}\n"
+            "Some questions do not have valid answer keys.\n"
+            f"<b>Question positions:</b> {escape(positions)}\n"
+            "Correct the answer keys before publishing scores."
+        )
+
+    mode = (
+        "LIVE / PROVISIONAL"
+        if data.get("provisional")
+        else "FINAL"
+    )
+
     lines = [
-        "🏆 <b>GRAMMAR FINAL LEADERBOARD</b>",
-        "🪷 <b>PH | CURRENT AFFAIRS INTELLIGENCE</b>",
-        "👥 Group ID:",
-        f"<code>{group_id}</code>",
-        "",
-        f"📝 Mock: <b>{title}</b>",
-        f"📝 Total Questions: {total}",
-        "📌 Marking: +1 correct · −0.25 wrong · 0 unanswered",
+        f"🏆 <b>GROUP {mode} LEADERBOARD</b>",
+        "🪷 <b>PH | PRACTICE HUB</b>",
+        f"📝 <b>Quiz:</b> {quiz_title}",
+        f"👥 <b>Group ID:</b> <code>{group_id}</code>",
+        f"📝 <b>Total Questions:</b> {total_questions}",
+        "📌 <b>Marking:</b> +1 correct · −0.25 wrong · 0 unanswered",
         "━━━━━━━━━━━━━━━━━━",
     ]
 
-    if data.get("provisional"):
-        lines.insert(0, "🟡 <b>LIVE RESULTS — PROVISIONAL</b>")
+    medals = ["🥇", "🥈", "🥉"]
 
-    for index, row in enumerate(rows, start=1):
-        name = _student_name(
-            row.get("student_name"),
-            str(row["student_id"]),
+    for index, row in enumerate(valid_rows[:max(0, limit)]):
+        rank = row.get("rank") or index + 1
+        medal = medals[rank - 1] if 1 <= rank <= 3 else f"{rank}."
+
+        name = escape(str(row.get("student_name") or "Student"))
+        score = float(row.get("score", 0.0))
+        score_percentage = float(row.get("score_percentage", 0.0))
+        accuracy = float(row.get("accuracy", 0.0))
+        overall_percentile = float(
+            row.get("overall_percentile", 0.0)
+        )
+        group_percentile = float(
+            row.get("group_percentile", 0.0)
         )
 
-        # Find the same attempt in the overall population.
-        overall_row = next(
-            (
-                candidate for candidate in overall
-                if candidate["attempt_id"] == row["attempt_id"]
-            ),
-            None,
+        correct = int(row.get("correct_count", 0))
+        wrong = int(row.get("wrong_count", 0))
+        unanswered = int(row.get("unanswered_count", 0))
+        attempted = int(row.get("attempted_count", 0))
+        time_used = _format_time(
+            int(row.get("time_used_seconds", 0))
         )
-        overall_percentile = (
-            overall_row.get("overall_percentile", 0.0)
-            if overall_row else 0.0
-        )
-
-        medal = medals[index - 1] if index <= 3 else f"{index}."
-        time_used = format_time(row["time_used_seconds"])
 
         lines.extend([
             f"{medal} <b>{name}</b>",
-            f"🎯 Net Score: <b>{row['net_score']:.2f}/{total}</b>",
-            f"📊 Score Percentage: {row['score_percentage']:.2f}%",
-            f"🌐 Overall Percentile: {overall_percentile:.1f}",
-            f"👥 Group Percentile: {row.get('group_percentile', 0.0):.1f}",
-            f"🎯 Accuracy: {row['accuracy']:.2f}%",
-            f"✅ Correct: {row['correct']} · ❌ Wrong: {row['wrong']}",
-            f"📝 Attempted: {row['attempted']}/{total} · "
-            f"⏭️ Unanswered: {row['unanswered']}",
+            f"🎯 Net Score: <b>{score:.2f}/{total_questions}</b>",
+            (
+                f"📊 Score Percentage: {score_percentage:.2f}%"
+                f" · 🏅 Overall Percentile: {overall_percentile:.2f}"
+            ),
+            f"👥 Group Percentile: {group_percentile:.2f}",
+            f"🎯 Accuracy: {accuracy:.2f}%",
+            f"✅ Correct: {correct} · ❌ Wrong: {wrong}",
+            (
+                f"📝 Attempted: {attempted}/{total_questions}"
+                f" · ⏭️ Unanswered: {unanswered}"
+            ),
             f"⏱️ Time Used: {time_used}",
             "━━━━━━━━━━━━━━━━━━",
         ])
 
-    if not rows:
-        lines.append("No recorded attempts yet.")
+    if not valid_rows:
+        lines.append("No valid scored attempts are available yet.")
 
-    lines.append("✍️ Created by Ph")
     return "\n".join(lines)
