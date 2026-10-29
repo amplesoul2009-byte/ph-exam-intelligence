@@ -1,5 +1,5 @@
 
-"""Quiz import service for PH Greybot."""
+"""Quiz import service for PH Practice Hub."""
 
 import json
 from datetime import date
@@ -10,14 +10,11 @@ from sqlalchemy.orm import Session
 from database import ImportBatch, Quiz, QuizQuestion
 from quiz_analyzer import analyze_import
 from quiz_parser import parse_quiz_text
+from subjects import (
+    ensure_default_subjects,
+    resolve_active_subject,
+)
 
-
-ALLOWED_SUBJECTS = {
-    "quant",
-    "reasoning",
-    "english",
-    "computer",
-}
 
 ALLOWED_LEVELS = {"prelims", "mains"}
 
@@ -44,7 +41,7 @@ def import_quiz_text(
     """
 
     title = title.strip() if isinstance(title, str) else ""
-    subject = subject.strip().lower() if isinstance(subject, str) else ""
+    subject = subject.strip() if isinstance(subject, str) else ""
     level = level.strip().lower() if isinstance(level, str) else ""
 
     if not title:
@@ -55,10 +52,20 @@ def import_quiz_text(
             "Quiz title cannot exceed 200 characters."
         )
 
-    if subject not in ALLOWED_SUBJECTS:
+    # Resolve the subject from the persistent subject registry.
+    # This allows owner-created subjects without editing this file.
+    ensure_default_subjects(db)
+    selected_subject = resolve_active_subject(db, subject)
+
+    if selected_subject is None:
         raise QuizImportError(
-            "Subject must be quant, reasoning, english, or computer."
+            f"Unknown or disabled subject: {subject}. "
+            "Use /subjects to view available subjects, "
+            "or /addsubject NAME to create one."
         )
+
+    # Keep the stable subject ID in the quiz record.
+    subject = selected_subject.subject_id
 
     if level not in ALLOWED_LEVELS:
         raise QuizImportError(
@@ -130,8 +137,7 @@ def import_quiz_text(
         db.add(batch)
         db.flush()
 
-        # Keep direct references to records. SQLAlchemy may clear
-        # db.new after flush(), so do not use db.new for later analysis.
+        # Keep references to records after flush().
         question_records = []
 
         for position, question in enumerate(
@@ -185,7 +191,7 @@ def import_quiz_text(
                     "Quiz analyzer returned an invalid questions list."
                 )
 
-            # Never silently associate an analysis with the wrong question.
+            # Never associate analysis with the wrong question.
             if len(analyses) != len(question_records):
                 raise ValueError(
                     "The number of analysis results does not match "
@@ -211,7 +217,6 @@ def import_quiz_text(
                     "needs_review",
                 )
 
-                # Imported answer keys must be reviewed by the owner.
                 if review_status not in {
                     "pending",
                     "needs_review",
@@ -246,8 +251,7 @@ def import_quiz_text(
             )
 
         except Exception as exc:
-            # Keep the quiz as a draft if analysis fails.
-            # Do not discard imported questions or their supplied keys.
+            # Keep the draft and questions if analysis fails.
             batch.status = "analysis_failed"
             batch.accepted_count = len(parsed.questions)
             batch.warning_count = (
@@ -270,7 +274,6 @@ def import_quiz_text(
 
             for question_record in question_records:
                 question_record.review_status = "needs_review"
-
                 question_record.analysis_report = json.dumps(
                     {
                         "status": "needs_review",
