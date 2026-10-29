@@ -5,7 +5,7 @@ Supports:
 - Creating an unpublished quiz draft from numbered text.
 - Appending question batches to an existing draft.
 - Preserving existing questions when an appended batch fails.
-- Reviewing the combined quiz draft.
+- Reviewing the combined quiz draft and all import-batch findings.
 - Exporting all questions into one ordered text document.
 - A maximum of 200 questions per quiz.
 
@@ -290,7 +290,7 @@ def import_quiz_text(
             )
 
         except Exception as exc:
-            # Keep the imported questions even if analysis fails.
+            # Keep imported questions even if analysis fails.
             batch.status = "analysis_failed"
             batch.accepted_count = len(parsed.questions)
             batch.warning_count = (
@@ -306,6 +306,8 @@ def import_quiz_text(
                         "Questions were saved as a draft. "
                         "Owner review is required before publication."
                     ),
+                    "parser_errors": parsed.errors,
+                    "parser_warnings": parsed.warnings,
                 },
                 ensure_ascii=False,
             )
@@ -464,7 +466,7 @@ def append_quiz_batch(
 
 
 def review_quiz_draft(db: Session, quiz_id: int) -> dict:
-    """Validate a combined draft without approving or publishing it."""
+    """Validate a draft and include findings from all import batches."""
     quiz = (
         db.query(Quiz)
         .filter(Quiz.id == quiz_id)
@@ -537,8 +539,69 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
         .all()
     )
 
+    # Read findings stored by the initial import and appended batches.
+    report_fields = (
+        ("errors", "error"),
+        ("error", "analysis error"),
+        ("parser_errors", "parser error"),
+        ("warnings", "warning"),
+        ("parser_warnings", "parser warning"),
+    )
+
+    for batch in batches:
+        try:
+            report = json.loads(batch.report_json or "{}")
+        except (TypeError, ValueError):
+            report = {}
+            problems.append(
+                f"Import batch {batch.id}: saved report is invalid JSON."
+            )
+
+        if not isinstance(report, dict):
+            report = {}
+            problems.append(
+                f"Import batch {batch.id}: invalid report format."
+            )
+
+        for field_name, label in report_fields:
+            findings = report.get(field_name, [])
+
+            if isinstance(findings, str):
+                findings = [findings]
+
+            if not isinstance(findings, list):
+                continue
+
+            for finding in findings:
+                finding_text = str(finding).strip()
+
+                if finding_text:
+                    problems.append(
+                        f"Import batch {batch.id} {label}: "
+                        f"{finding_text[:300]}"
+                    )
+
+        if batch.status == "analysis_failed":
+            problems.append(
+                f"Import batch {batch.id}: analysis failed; "
+                "manually inspect this batch before approval."
+            )
+
+        if batch.accepted_count != batch.detected_count:
+            problems.append(
+                f"Import batch {batch.id}: accepted count "
+                f"({batch.accepted_count}) differs from detected count "
+                f"({batch.detected_count})."
+            )
+
     question_count = len(questions)
     within_limit = 0 < question_count <= MAX_QUIZ_QUESTIONS
+
+    if not within_limit:
+        problems.append(
+            f"Question count must be between 1 and "
+            f"{MAX_QUIZ_QUESTIONS}; found {question_count}."
+        )
 
     return {
         "quiz_id": quiz.id,
