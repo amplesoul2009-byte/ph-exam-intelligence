@@ -1,308 +1,747 @@
+
 """PH Practice Hub / 0xGREY Telegram bot entry point.
 
-Owner-only quiz management; only owner-approved groups can receive quizzes.
-Uses the repository's existing SQLAlchemy models and poll services.
+Owner-controlled quiz management.
+Only owner-approved groups receive quiz polls.
+
+Participant attempts are created automatically when a student
+answers their first registered poll.
 """
+
 from __future__ import annotations
 
 import logging
-from datetime import date
-from html import escape
 
+from sqlalchemy import select
 from telegram import Update
 from telegram.constants import PollType
+from telegram.error import TelegramError
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters,
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
-from sqlalchemy import select
 
 from config import load_settings
-from database import SessionLocal, Quiz, QuizQuestion, QuizAttempt
+from database import (
+    SessionLocal,
+    Quiz,
+    QuizAttempt,
+    QuizQuestion,
+)
 from database_init import initialize_database
-from group_access import approve_group, is_group_approved, list_approved_groups, revoke_group
+from group_access import (
+    approve_group,
+    is_group_approved,
+    list_approved_groups,
+    revoke_group,
+)
 from owner_auth import owner_only
-from poll_registry import PollRegistry, close_poll, register_poll
-from participant_poll_attempt import register_participant_attempt
+from poll_registry import (
+    PollRegistry,
+    close_poll,
+    register_poll,
+)
 from poll_answer_handler import install_poll_answer_handler
-from live_poll_service import finalize_attempt, start_attempt
-from quiz_import_service import import_quiz_text, QuizImportError
+from live_poll_service import finalize_attempt
+from quiz_import_service import (
+    QuizImportError,
+    import_quiz_text,
+)
 from leaderboard_publisher import publish_group_leaderboard
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ph_practice_hub")
 
 
-def _owner_id(update: Update) -> int | None:
-    return update.effective_user.id if update.effective_user else None
+def _message(update: Update):
+    return update.effective_message
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "🪷 PH Practice Hub | 0xGREY\n\n"
-        "Use /help to see commands.\n"
-        "Students: quizzes appear only in owner-approved groups."
-    )
-    if update.effective_message:
-        await update.effective_message.reply_text(text)
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if message:
+        await message.reply_text(
+            "🪷 PH Practice Hub | 0xGREY\n\n"
+            "Use /help to view commands.\n"
+            "Students: answer quiz polls in approved groups."
+        )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "PH Practice Hub commands\n\n"
-        "Public: /start, /help\n\n"
-        "Owner only:\n"
-        "/approvegroup CHAT_ID — approve a group\n"
-        "/revokegroup CHAT_ID — revoke a group\n"
-        "/groups — list approved groups\n"
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message:
+        return
+
+    await message.reply_text(
+        "🪷 PH PRACTICE HUB — COMMANDS\n\n"
+        "Public:\n"
+        "/start\n"
+        "/help\n\n"
+        "OWNER ONLY:\n"
+        "/approvegroup CHAT_ID\n"
+        "/revokegroup CHAT_ID\n"
+        "/groups\n"
         "/importquiz TITLE | SUBJECT | LEVEL | YYYY-MM-DD\n"
-        "Then send the question text in the next message.\n"
-        "Subjects: quant, reasoning, english, computer. Levels: prelims, mains.\n"
-        "/quizzes — list saved quizzes\n"
-        "/approvequiz ID — approve after checking answer keys\n"
-        "/publishquiz ID — publish polls to approved groups\n"
-        "/endquiz ID CHAT_ID — close its polls and publish leaderboard\n\n"
-        "Question format: 1. Question text; A. ...; B. ...; C. ...; D. ...; Answer: B; Explanation: ..."
+        "/cancelimport\n"
+        "/quizzes\n"
+        "/approvequiz QUIZ_ID\n"
+        "/publishquiz QUIZ_ID\n"
+        "/endquiz QUIZ_ID CHAT_ID\n\n"
+        "Subjects: quant, reasoning, english, computer\n"
+        "Levels: prelims, mains\n\n"
+        "Import instructions:\n"
+        "1. Send /importquiz with the quiz details.\n"
+        "2. Send all numbered questions in one message.\n"
+        "3. Review the saved draft and answer keys.\n"
+        "4. Use /approvequiz ID only after checking every answer.\n"
+        "5. Use /publishquiz ID to send polls to approved groups.\n\n"
+        "Question format:\n"
+        "1. Question text\n"
+        "A. First option\n"
+        "B. Second option\n"
+        "C. Third option\n"
+        "D. Fourth option\n"
+        "Answer: B\n"
+        "Explanation: Explanation text"
     )
-    if update.effective_message:
-        await update.effective_message.reply_text(text)
 
 
-async def approvegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
+async def approvegroup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
         return
+
     if not context.args:
-        await update.effective_message.reply_text("Usage: /approvegroup CHAT_ID (add the bot to the group first).")
+        await message.reply_text(
+            "Usage: /approvegroup CHAT_ID\n"
+            "Add the bot to the group first."
+        )
         return
+
     chat_id = context.args[0]
+
     try:
         with SessionLocal() as db:
             group = approve_group(db, chat_id, "")
-        await update.effective_message.reply_text(f"Approved group {group.chat_id}. Only this allowlisted group can receive quizzes.")
+
+        await message.reply_text(
+            f"Approved group: {group.chat_id}\n"
+            "Only owner-approved groups may receive quizzes."
+        )
     except Exception as exc:
-        logger.exception("approvegroup failed")
-        await update.effective_message.reply_text(f"Could not approve group: {exc}")
+        logger.exception("Failed to approve group")
+        await message.reply_text(
+            f"Could not approve group: {str(exc)[:500]}"
+        )
 
 
-async def revokegroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
+async def revokegroup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
         return
+
     if not context.args:
-        await update.effective_message.reply_text("Usage: /revokegroup CHAT_ID")
+        await message.reply_text("Usage: /revokegroup CHAT_ID")
         return
+
     with SessionLocal() as db:
         changed = revoke_group(db, context.args[0])
-    await update.effective_message.reply_text("Group access revoked." if changed else "Group was not active or was not found.")
 
-
-async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
-        return
-    with SessionLocal() as db:
-        groups = list_approved_groups(db)
-    if not groups:
-        text = "No groups are currently approved."
-    else:
-        text = "Approved groups:\n" + "\n".join(f"• {g['chat_title'] or '(untitled)'} — {g['chat_id']}" for g in groups)
-    await update.effective_message.reply_text(text)
-
-
-async def importquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
-        return
-    raw = " ".join(context.args).strip()
-    parts = [part.strip() for part in raw.split("|")]
-    if len(parts) != 4 or not all(parts):
-        await update.effective_message.reply_text(
-            "Usage:\n/importquiz TITLE | SUBJECT | LEVEL | YYYY-MM-DD\n\n"
-            "Then send all numbered questions in your next message."
-        )
-        return
-    title, subject, level, quiz_date = parts
-    context.user_data["pending_quiz_import"] = {
-        "title": title, "subject": subject, "level": level, "quiz_date": quiz_date
-    }
-    await update.effective_message.reply_text(
-        "Now send the complete question text in one message. Import creates a draft only; it does not publish automatically."
+    await message.reply_text(
+        "Group access revoked."
+        if changed
+        else "Group is not active or was not found."
     )
 
 
-async def receive_import_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pending = context.user_data.get("pending_quiz_import")
-    if not pending or not update.effective_message or not update.effective_message.text:
+async def groups_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
         return
+
+    with SessionLocal() as db:
+        groups = list_approved_groups(db)
+
+    if not groups:
+        await message.reply_text("No groups are currently approved.")
+        return
+
+    lines = ["APPROVED TELEGRAM GROUPS", ""]
+
+    for group in groups:
+        lines.append(
+            f"{group['chat_title'] or '(untitled)'} — "
+            f"{group['chat_id']}"
+        )
+
+    await message.reply_text("\n".join(lines))
+
+
+async def importquiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if update.effective_user is None:
+        return
+
+    raw = " ".join(context.args).strip()
+    parts = [part.strip() for part in raw.split("|")]
+
+    if len(parts) != 4 or not all(parts):
+        await message.reply_text(
+            "Usage:\n"
+            "/importquiz TITLE | SUBJECT | LEVEL | YYYY-MM-DD\n\n"
+            "Example:\n"
+            "/importquiz Banking Quiz | quant | prelims | 2026-10-29"
+        )
+        return
+
+    title, subject, level, quiz_date = parts
+
+    context.user_data["pending_quiz_import"] = {
+        "title": title,
+        "subject": subject,
+        "level": level,
+        "quiz_date": quiz_date,
+    }
+
+    await message.reply_text(
+        "Send the complete numbered questions in your next message.\n\n"
+        "This creates a draft only. It will not publish automatically.\n"
+        "Use /cancelimport if you want to cancel."
+    )
+
+
+async def cancelimport(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    context.user_data.pop("pending_quiz_import", None)
+    await message.reply_text("Pending quiz import cancelled.")
+
+
+async def receive_import_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+
+    if not message or not message.text:
+        return
+
+    if "pending_quiz_import" not in context.user_data:
+        return
+
     if not await owner_only(update, context):
         return
-    body = update.effective_message.text
-    settings = load_settings()
+
+    pending = context.user_data["pending_quiz_import"]
+
     try:
+        settings = load_settings()
+
         with SessionLocal() as db:
             result = import_quiz_text(
-                db, title=pending["title"], subject=pending["subject"],
-                level=pending["level"], quiz_date=pending["quiz_date"],
-                text=body, settings=settings, max_questions=200,
+                db,
+                title=pending["title"],
+                subject=pending["subject"],
+                level=pending["level"],
+                quiz_date=pending["quiz_date"],
+                text=message.text,
+                settings=settings,
+                max_questions=200,
             )
+
         context.user_data.pop("pending_quiz_import", None)
-        await update.effective_message.reply_text(
-            f"Draft saved.\nQuiz ID: {result['quiz_id']}\n"
+
+        await message.reply_text(
+            "DRAFT SAVED\n\n"
+            f"Quiz ID: {result['quiz_id']}\n"
+            f"Title: {result['title']}\n"
             f"Questions detected: {result['detected_questions']}\n"
-            f"Analysis: {result['analysis_status']}\n\n"
-            "Please verify every answer and explanation before /approvequiz ID."
+            f"Analysis status: {result['analysis_status']}\n\n"
+            "Review every question, option, answer key and explanation.\n"
+            f"Then use /approvequiz {result['quiz_id']}."
         )
+
     except (QuizImportError, ValueError) as exc:
-        await update.effective_message.reply_text(f"Import not completed: {exc}")
-    except Exception as exc:
-        logger.exception("quiz import failed")
-        await update.effective_message.reply_text(f"Import failed safely: {exc}")
+        await message.reply_text(
+            f"Import not completed:\n{str(exc)[:1500]}\n\n"
+            "Correct the text and send it again, or use /cancelimport."
+        )
+
+    except Exception:
+        logger.exception("Quiz import failed")
+
+        await message.reply_text(
+            "The import failed. Check the deployment logs before retrying. "
+            "The database transaction may have been rolled back."
+        )
 
 
-async def quizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
+async def quizzes_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
         return
+
     with SessionLocal() as db:
-        rows = db.scalars(select(Quiz).order_by(Quiz.id.desc()).limit(30)).all()
-        lines = [f"#{q.id} | {q.title} | {q.status} | {q.question_count} Q | {q.quiz_date}" for q in rows]
-    await update.effective_message.reply_text("Saved quizzes:\n" + ("\n".join(lines) if lines else "None yet."))
+        quizzes = db.scalars(
+            select(Quiz).order_by(Quiz.id.desc()).limit(30)
+        ).all()
 
+        rows = [
+            (
+                quiz.id,
+                quiz.title,
+                quiz.status,
+                quiz.question_count,
+                quiz.quiz_date,
+            )
+            for quiz in quizzes
+        ]
 
-async def approvequiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
+    if not rows:
+        await message.reply_text("No saved quizzes yet.")
         return
+
+    lines = ["SAVED QUIZZES", ""]
+
+    for quiz_id, title, status, count, quiz_date in rows:
+        lines.append(
+            f"#{quiz_id} | {title} | {status} | "
+            f"{count} questions | {quiz_date}"
+        )
+
+    await message.reply_text("\n".join(lines)[:4000])
+
+
+async def approvequiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
     if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Usage: /approvequiz ID")
+        await message.reply_text("Usage: /approvequiz QUIZ_ID")
         return
+
     quiz_id = int(context.args[0])
+
     with SessionLocal() as db:
         quiz = db.get(Quiz, quiz_id)
+
         if quiz is None:
-            await update.effective_message.reply_text("Quiz not found.")
+            await message.reply_text("Quiz not found.")
             return
-        questions = db.scalars(select(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id).order_by(QuizQuestion.position)).all()
+
+        questions = db.scalars(
+            select(QuizQuestion)
+            .where(QuizQuestion.quiz_id == quiz_id)
+            .order_by(QuizQuestion.position)
+        ).all()
+
         if not questions:
-            await update.effective_message.reply_text("Cannot approve a quiz with no questions.")
+            await message.reply_text(
+                "Cannot approve a quiz without questions."
+            )
             return
-        invalid = [q.position for q in questions if (q.correct_option or "").strip().upper() not in set("ABCD") or not all([q.question_text.strip(), q.option_a.strip(), q.option_b.strip(), q.option_c.strip(), q.option_d.strip()])]
-        if invalid:
-            await update.effective_message.reply_text("Cannot approve: missing/invalid answer key or option in question(s): " + ", ".join(map(str, invalid)))
+
+        invalid_positions = []
+
+        for question in questions:
+            valid_key = (
+                (question.correct_option or "").strip().upper()
+                in {"A", "B", "C", "D"}
+            )
+
+            valid_fields = all(
+                [
+                    question.question_text.strip(),
+                    question.option_a.strip(),
+                    question.option_b.strip(),
+                    question.option_c.strip(),
+                    question.option_d.strip(),
+                ]
+            )
+
+            if not valid_key or not valid_fields:
+                invalid_positions.append(question.position)
+
+        if invalid_positions:
+            await message.reply_text(
+                "Approval blocked. Check question(s): "
+                + ", ".join(map(str, invalid_positions))
+            )
             return
+
         quiz.status = "approved"
         db.commit()
-    await update.effective_message.reply_text(f"Quiz #{quiz_id} approved. Review the source answer keys manually before publishing.")
+
+    await message.reply_text(
+        f"Quiz #{quiz_id} approved.\n"
+        "Ensure you personally checked the supplied answer keys "
+        "and explanations before publishing."
+    )
 
 
-async def publishquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
-        return
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Usage: /publishquiz ID")
-        return
-    quiz_id = int(context.args[0])
-    with SessionLocal() as db:
-        quiz = db.get(Quiz, quiz_id)
-        if quiz is None or quiz.status not in {"approved", "published", "live"}:
-            await update.effective_message.reply_text("Quiz not found or not approved. Use /approvequiz ID after checking it.")
-            return
-        questions = db.scalars(select(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id).order_by(QuizQuestion.position)).all()
-        groups = list_approved_groups(db)
-    if not groups:
-        await update.effective_message.reply_text("No approved groups. Use /approvegroup CHAT_ID first.")
-        return
-    if not questions:
-        await update.effective_message.reply_text("This quiz has no questions.")
-        return
-    sent_count = 0
-    for group in groups:
-        chat_id = int(group["chat_id"]) if group["chat_id"].lstrip("-").isdigit() else group["chat_id"]
-        if not await _is_approved(chat_id):
-            continue
-        for q in questions:
-            options = [q.option_a, q.option_b, q.option_c, q.option_d]
-            correct_idx = "ABCD".find((q.correct_option or "").upper())
-            if correct_idx < 0:
-                continue
-            msg = await context.bot.send_poll(
-                chat_id=chat_id,
-                question=f"{quiz.title} | Q{q.position}/{len(questions)}\n\n{q.question_text}"[:300],
-                options=[x[:100] for x in options],
-                type=PollType.QUIZ,
-                correct_option_id=correct_idx,
-                is_anonymous=False,
-                explanation=(q.explanation or "")[0:200],
-                open_period=max(5, min(int(q.timer_seconds or 30), 600)),
-            )
-            with SessionLocal() as db:
-                register_poll(db, poll_id=msg.poll.id, quiz_id=quiz_id, question_id=q.id, group_id=chat_id, message_id=msg.message_id)
-            sent_count += 1
-    with SessionLocal() as db:
-        quiz = db.get(Quiz, quiz_id)
-        if quiz:
-            quiz.status = "live"
-            db.commit()
-    await update.effective_message.reply_text(f"Published {sent_count} question polls across owner-approved groups for quiz #{quiz_id}.")
-
-
-async def _is_approved(chat_id) -> bool:
+async def _group_is_approved(chat_id: str | int) -> bool:
     with SessionLocal() as db:
         return is_group_approved(db, chat_id)
 
 
-async def endquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update, context):
+async def publishquiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
         return
-    if len(context.args) != 2 or not all(arg.lstrip("-").isdigit() for arg in context.args):
-        await update.effective_message.reply_text("Usage: /endquiz QUIZ_ID CHAT_ID")
+
+    if not context.args or not context.args[0].isdigit():
+        await message.reply_text("Usage: /publishquiz QUIZ_ID")
         return
-    quiz_id, chat_id = map(int, context.args)
-    if not await _is_approved(chat_id):
-        await update.effective_message.reply_text("Blocked: that group is not owner-approved.")
-        return
-    # Close this quiz's polls in the selected group and preserve all answers.
+
+    quiz_id = int(context.args[0])
+
     with SessionLocal() as db:
-        poll_rows = db.scalars(select(PollRegistry).where(
-            PollRegistry.quiz_id == quiz_id,
-            PollRegistry.group_id == str(chat_id),
-            PollRegistry.open.is_(True),
-        )).all()
-        poll_details = [(row.poll_id, row.message_id) for row in poll_rows]
+        quiz = db.get(Quiz, quiz_id)
+
+        if quiz is None:
+            await message.reply_text("Quiz not found.")
+            return
+
+        if quiz.status not in {"approved", "published", "live"}:
+            await message.reply_text(
+                "This quiz is not approved. Check the answer keys "
+                "and run /approvequiz QUIZ_ID first."
+            )
+            return
+
+        questions = db.scalars(
+            select(QuizQuestion)
+            .where(QuizQuestion.quiz_id == quiz_id)
+            .order_by(QuizQuestion.position)
+        ).all()
+
+        groups = list_approved_groups(db)
+
+        # Copy primitive values so detached ORM records aren't needed later.
+        title = quiz.title
+        question_data = [
+            {
+                "id": q.id,
+                "position": q.position,
+                "question_text": q.question_text,
+                "options": [
+                    q.option_a,
+                    q.option_b,
+                    q.option_c,
+                    q.option_d,
+                ],
+                "correct_option": (
+                    (q.correct_option or "").strip().upper()
+                ),
+                "explanation": q.explanation or "",
+                "timer_seconds": q.timer_seconds or 30,
+            }
+            for q in questions
+        ]
+
+    if not groups:
+        await message.reply_text(
+            "No approved groups. Add the bot to a group, then use "
+            "/approvegroup CHAT_ID."
+        )
+        return
+
+    if not question_data:
+        await message.reply_text("This quiz has no questions.")
+        return
+
+    sent_count = 0
+    failed_count = 0
+
+    for group in groups:
+        chat_id_text = str(group["chat_id"])
+
+        if not await _group_is_approved(chat_id_text):
+            logger.warning(
+                "Skipped revoked group %s during publication",
+                chat_id_text,
+            )
+            continue
+
+        chat_id = (
+            int(chat_id_text)
+            if chat_id_text.lstrip("-").isdigit()
+            else chat_id_text
+        )
+
+        for question in question_data:
+            correct_option = question["correct_option"]
+
+            if correct_option not in {"A", "B", "C", "D"}:
+                failed_count += 1
+                logger.error(
+                    "Skipped question %s: invalid answer key",
+                    question["position"],
+                )
+                continue
+
+            options = question["options"]
+
+            if not all(
+                isinstance(option, str) and option.strip()
+                for option in options
+            ):
+                failed_count += 1
+                continue
+
+            timer = max(
+                5,
+                min(int(question["timer_seconds"]), 600),
+            )
+
+            try:
+                sent_poll = await context.bot.send_poll(
+                    chat_id=chat_id,
+                    question=(
+                        f"{title} | Q{question['position']}/"
+                        f"{len(question_data)}\n\n"
+                        f"{question['question_text']}"
+                    )[:300],
+                    options=[option[:100] for option in options],
+                    type=PollType.QUIZ,
+                    correct_option_id="ABCD".index(correct_option),
+                    is_anonymous=False,
+                    explanation=question["explanation"][:200],
+                    open_period=timer,
+                )
+
+                with SessionLocal() as db:
+                    register_poll(
+                        db,
+                        poll_id=sent_poll.poll.id,
+                        quiz_id=quiz_id,
+                        question_id=question["id"],
+                        group_id=chat_id_text,
+                        message_id=sent_poll.message_id,
+                        attempt_mode="group_quiz",
+                    )
+
+                sent_count += 1
+
+            except TelegramError:
+                failed_count += 1
+                logger.exception(
+                    "Telegram failed to publish question %s to %s",
+                    question["position"],
+                    chat_id_text,
+                )
+            except Exception:
+                failed_count += 1
+                logger.exception(
+                    "Failed to register poll for question %s in %s",
+                    question["position"],
+                    chat_id_text,
+                )
+
+    with SessionLocal() as db:
+        quiz = db.get(Quiz, quiz_id)
+
+        if quiz is not None and sent_count > 0:
+            quiz.status = "live"
+            db.commit()
+
+    await message.reply_text(
+        f"Quiz #{quiz_id}: publication finished.\n"
+        f"Polls sent and registered: {sent_count}\n"
+        f"Failed or skipped: {failed_count}\n"
+        "Only owner-approved groups were targeted.\n\n"
+        "Participant attempts are created when students first answer."
+    )
+
+
+async def endquiz(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = _message(update)
+    if not message or not await owner_only(update, context):
+        return
+
+    if (
+        len(context.args) != 2
+        or not context.args[0].isdigit()
+        or not context.args[1].lstrip("-").isdigit()
+    ):
+        await message.reply_text(
+            "Usage: /endquiz QUIZ_ID CHAT_ID"
+        )
+        return
+
+    quiz_id = int(context.args[0])
+    chat_id_text = context.args[1]
+    chat_id = int(chat_id_text)
+
+    if not await _group_is_approved(chat_id_text):
+        await message.reply_text(
+            "Blocked: this group is not owner-approved."
+        )
+        return
+
+    with SessionLocal() as db:
+        polls = db.scalars(
+            select(PollRegistry).where(
+                PollRegistry.quiz_id == quiz_id,
+                PollRegistry.group_id == chat_id_text,
+                PollRegistry.open.is_(True),
+            )
+        ).all()
+
+        poll_details = [
+            (poll.poll_id, poll.message_id)
+            for poll in polls
+        ]
+
+    closed_count = 0
+
     for poll_id, message_id in poll_details:
         try:
-            await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+            await context.bot.stop_poll(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except TelegramError:
+            # A timed poll may already have closed on Telegram.
+            logger.info(
+                "Poll %s may already be closed",
+                poll_id,
+            )
         except Exception:
-            logger.exception("Could not stop poll %s", poll_id)
+            logger.exception(
+                "Unexpected error stopping poll %s",
+                poll_id,
+            )
+
         with SessionLocal() as db:
-            close_poll(db, poll_id)
+            if close_poll(db, poll_id):
+                closed_count += 1
+
     with SessionLocal() as db:
-        attempts = db.scalars(select(QuizAttempt).where(
-            QuizAttempt.quiz_id == quiz_id,
-            QuizAttempt.group_id == str(chat_id),
-            QuizAttempt.status == "in_progress",
-        )).all()
+        attempts = db.scalars(
+            select(QuizAttempt).where(
+                QuizAttempt.quiz_id == quiz_id,
+                QuizAttempt.group_id == chat_id_text,
+                QuizAttempt.status == "in_progress",
+            )
+        ).all()
+
         attempt_ids = [attempt.id for attempt in attempts]
+
+    finalized_count = 0
+
     for attempt_id in attempt_ids:
-        with SessionLocal() as db:
-            finalize_attempt(db, attempt_id=attempt_id)
-    await publish_group_leaderboard(context.bot, chat_id, quiz_id)
-    await update.effective_message.reply_text(
-        f"Quiz #{quiz_id} ended for group {chat_id}. Polls closed; submitted answers retained; leaderboard published if scoring data is valid."
+        try:
+            with SessionLocal() as db:
+                finalize_attempt(db, attempt_id=attempt_id)
+            finalized_count += 1
+        except Exception:
+            logger.exception(
+                "Failed to finalize attempt %s",
+                attempt_id,
+            )
+
+    try:
+        await publish_group_leaderboard(
+            context.bot,
+            chat_id,
+            quiz_id,
+        )
+    except Exception:
+        logger.exception("Leaderboard publication failed")
+        await message.reply_text(
+            "Polls were closed and attempts finalized, but leaderboard "
+            "publication failed. Check the deployment logs."
+        )
+        return
+
+    await message.reply_text(
+        f"Quiz #{quiz_id} ended for group {chat_id_text}.\n"
+        f"Polls closed in registry: {closed_count}\n"
+        f"Attempts finalized: {finalized_count}\n"
+        "Stored answers were retained."
     )
 
 
 def main() -> None:
     settings = load_settings()
+
+    # Register every model before creating missing tables.
     initialize_database()
-    app = Application.builder().token(settings.bot_token).build()
+
+    app = (
+        Application.builder()
+        .token(settings.bot_token)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+
     app.add_handler(CommandHandler("approvegroup", approvegroup))
     app.add_handler(CommandHandler("revokegroup", revokegroup))
     app.add_handler(CommandHandler("groups", groups_command))
+
     app.add_handler(CommandHandler("importquiz", importquiz))
+    app.add_handler(CommandHandler("cancelimport", cancelimport))
     app.add_handler(CommandHandler("quizzes", quizzes_command))
     app.add_handler(CommandHandler("approvequiz", approvequiz))
     app.add_handler(CommandHandler("publishquiz", publishquiz))
     app.add_handler(CommandHandler("endquiz", endquiz))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_import_text))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            receive_import_text,
+        )
+    )
+
     install_poll_answer_handler(app)
-    logger.info("PH Practice Hub bot starting with polling.")
+
+    logger.info("PH Practice Hub bot starting in polling mode.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
