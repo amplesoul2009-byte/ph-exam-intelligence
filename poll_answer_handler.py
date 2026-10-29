@@ -1,11 +1,8 @@
 
-"""Save Telegram quiz poll answers to participant attempts."""
-
-from __future__ import annotations
+"""Save Telegram poll answers to the correct quiz attempt."""
 
 import logging
 
-from sqlalchemy import select
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,13 +10,10 @@ from telegram.ext import (
     PollAnswerHandler,
 )
 
-from database import SessionLocal, QuizAttempt
-from live_poll_service import record_poll_answer, start_attempt
+from database import SessionLocal
+from live_poll_service import record_poll_answer
 from poll_registry import get_poll
-from participant_poll_attempt import (
-    get_attempt_id,
-    register_participant_attempt,
-)
+from participant_poll_attempt import get_attempt_id
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +22,13 @@ async def handle_poll_answer(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    item = update.poll_answer
+    answer = update.poll_answer
 
-    if item is None or item.user is None:
+    if answer is None or answer.user is None:
         return
 
-    poll_id = str(item.poll_id)
-    student_id = str(item.user.id)
+    poll_id = str(answer.poll_id)
+    student_id = str(answer.user.id)
 
     try:
         with SessionLocal() as db:
@@ -49,49 +43,25 @@ async def handle_poll_answer(
                 student_id=student_id,
             )
 
+            # Ignore answers until the bot has associated
+            # this participant with an active attempt.
             if attempt_id is None:
-                attempt = db.scalar(
-                    select(QuizAttempt)
-                    .where(
-                        QuizAttempt.quiz_id == poll.quiz_id,
-                        QuizAttempt.student_id == student_id,
-                        QuizAttempt.group_id == str(poll.group_id),
-                        QuizAttempt.status == "in_progress",
-                    )
-                    .order_by(QuizAttempt.id.desc())
+                logger.warning(
+                    "No attempt registered for poll %s and student %s",
+                    poll_id,
+                    student_id,
                 )
+                return
 
-                if attempt is None:
-                    attempt = start_attempt(
-                        db,
-                        quiz_id=poll.quiz_id,
-                        student_id=student_id,
-                        student_name=(
-                            item.user.full_name
-                            or item.user.username
-                            or "Student"
-                        ),
-                        group_id=poll.group_id,
-                    )
-
-                attempt_id = attempt.id
-
-                register_participant_attempt(
-                    db,
-                    poll_id=poll_id,
-                    student_id=student_id,
-                    attempt_id=attempt_id,
-                )
-
-            option_ids = item.option_ids
+            option_ids = answer.option_ids
 
             if not option_ids:
-                selected = None
-            elif len(option_ids) == 1 and option_ids[0] in range(4):
-                selected = "ABCD"[option_ids[0]]
+                selected_option = None
+            elif len(option_ids) == 1 and 0 <= option_ids[0] <= 3:
+                selected_option = "ABCD"[option_ids[0]]
             else:
                 logger.warning(
-                    "Unexpected poll selection for poll %s",
+                    "Unexpected option selection for poll %s",
                     poll_id,
                 )
                 return
@@ -100,12 +70,12 @@ async def handle_poll_answer(
                 db,
                 attempt_id=attempt_id,
                 question_id=poll.question_id,
-                selected_option=selected,
+                selected_option=selected_option,
             )
 
     except Exception:
         logger.exception(
-            "Failed to save answer for poll %s",
+            "Could not save answer for poll %s",
             poll_id,
         )
 
