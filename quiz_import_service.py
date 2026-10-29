@@ -3,14 +3,14 @@
 
 Supports:
 - Creating an unpublished quiz draft from numbered text.
-- Appending multiple question batches to the same draft.
-- Preserving earlier batches if a later batch fails.
-- Reviewing the combined draft.
-- Exporting all questions into one ordered TXT file.
-- A strict maximum of 200 questions per quiz.
+- Appending question batches to an existing draft.
+- Preserving existing questions when an appended batch fails.
+- Reviewing the combined quiz draft.
+- Exporting all questions into one ordered text document.
+- A maximum of 200 questions per quiz.
 
-This module does not approve or publish quizzes.
-The caller must enforce owner-only access.
+This module never approves or publishes quizzes.
+The calling bot must enforce owner-only access.
 """
 
 import json
@@ -109,7 +109,8 @@ def import_quiz_text(
 ) -> dict:
     """Parse, analyze, and save the first batch of a new draft.
 
-    The quiz remains unpublished. AI analysis never grants approval.
+    The quiz remains unpublished. Automated analysis never grants
+    owner approval.
     """
     title = title.strip() if isinstance(title, str) else ""
     subject = subject.strip() if isinstance(subject, str) else ""
@@ -148,7 +149,10 @@ def import_quiz_text(
             "Quiz date must use YYYY-MM-DD format."
         ) from None
 
-    parsed = parse_quiz_text(text, max_questions=max_questions)
+    parsed = parse_quiz_text(
+        text,
+        max_questions=max_questions,
+    )
 
     if not parsed.questions:
         details = " ".join(parsed.errors)
@@ -166,7 +170,7 @@ def import_quiz_text(
         title=title,
         subject=subject,
         level=level,
-        # Database schema stores quiz_date as String(20).
+        # database.py stores quiz_date as a string.
         quiz_date=parsed_date.isoformat(),
         status="draft",
         question_count=len(parsed.questions),
@@ -191,7 +195,10 @@ def import_quiz_text(
 
         question_records = []
 
-        for position, question in enumerate(parsed.questions, start=1):
+        for position, question in enumerate(
+            parsed.questions,
+            start=1,
+        ):
             record = _question_record(
                 quiz_id=quiz.id,
                 position=position,
@@ -225,7 +232,10 @@ def import_quiz_text(
                     "question count."
                 )
 
-            for record, analysis in zip(question_records, analyses):
+            for record, analysis in zip(
+                question_records,
+                analyses,
+            ):
                 if not isinstance(analysis, dict):
                     raise ValueError(
                         "Quiz analyzer returned an invalid question result."
@@ -237,7 +247,8 @@ def import_quiz_text(
                 )
 
                 review_status = analysis.get(
-                    "review_status", "needs_review"
+                    "review_status",
+                    "needs_review",
                 )
 
                 allowed_statuses = {
@@ -251,18 +262,23 @@ def import_quiz_text(
                 if review_status not in allowed_statuses:
                     review_status = "needs_review"
 
-                # AI must never grant owner approval.
+                # Automated analysis must never approve a question.
                 if review_status == "approved":
                     review_status = "pending_owner_approval"
 
                 record.review_status = review_status
 
             ai_status = report.get("ai_status")
+
             batch.status = (
                 "analysis_completed"
-                if ai_status in {"completed", "manual_review_required"}
+                if ai_status in {
+                    "completed",
+                    "manual_review_required",
+                }
                 else "analysis_failed"
             )
+
             batch.accepted_count = len(parsed.questions)
             batch.warning_count = (
                 len(report.get("warnings", []))
@@ -274,11 +290,13 @@ def import_quiz_text(
             )
 
         except Exception as exc:
-            # Keep parsed questions if optional analysis fails.
+            # Keep the imported questions even if analysis fails.
             batch.status = "analysis_failed"
             batch.accepted_count = len(parsed.questions)
             batch.warning_count = (
-                len(parsed.warnings) + len(parsed.errors) + 1
+                len(parsed.warnings)
+                + len(parsed.errors)
+                + 1
             )
             batch.report_json = json.dumps(
                 {
@@ -332,11 +350,18 @@ def append_quiz_batch(
     text: str,
     max_questions: int = MAX_QUIZ_QUESTIONS,
 ) -> dict:
-    """Append a numbered batch to an existing unpublished draft."""
+    """Append a batch to an existing unpublished draft.
+
+    Appended questions receive continuous positions and are stored
+    in the same quiz. Existing batches are not intentionally deleted.
+    """
     _validate_import_text(text)
     _validate_question_limit(max_questions)
 
-    parsed = parse_quiz_text(text, max_questions=max_questions)
+    parsed = parse_quiz_text(
+        text,
+        max_questions=max_questions,
+    )
 
     if not parsed.questions:
         details = " ".join(parsed.errors)
@@ -354,7 +379,9 @@ def append_quiz_batch(
         )
 
         if quiz is None:
-            raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
+            raise QuizImportError(
+                f"Quiz ID {quiz_id} was not found."
+            )
 
         if quiz.status not in {"draft", "draft_saved"}:
             raise QuizImportError(
@@ -382,22 +409,30 @@ def append_quiz_batch(
             original_content=text,
             detected_count=incoming_count,
             accepted_count=incoming_count,
-            warning_count=len(parsed.warnings) + len(parsed.errors),
+            warning_count=(
+                len(parsed.warnings) + len(parsed.errors)
+            ),
             status="needs_owner_review",
             report_json=json.dumps(
                 {
                     "source": "appended_text_batch",
                     "parser_errors": parsed.errors,
                     "parser_warnings": parsed.warnings,
-                    "message": "Appended questions require owner review.",
+                    "message": (
+                        "Appended questions require owner review."
+                    ),
                 },
                 ensure_ascii=False,
             ),
         )
+
         db.add(batch)
         db.flush()
 
-        for offset, question in enumerate(parsed.questions, start=1):
+        for offset, question in enumerate(
+            parsed.questions,
+            start=1,
+        ):
             db.add(
                 _question_record(
                     quiz_id=quiz_id,
@@ -410,6 +445,7 @@ def append_quiz_batch(
 
         quiz.question_count = existing_count + incoming_count
         quiz.status = "draft"
+
         db.commit()
 
         return {
@@ -428,11 +464,17 @@ def append_quiz_batch(
 
 
 def review_quiz_draft(db: Session, quiz_id: int) -> dict:
-    """Validate a draft without approving or publishing it."""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+    """Validate a combined draft without approving or publishing it."""
+    quiz = (
+        db.query(Quiz)
+        .filter(Quiz.id == quiz_id)
+        .first()
+    )
 
     if quiz is None:
-        raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
+        raise QuizImportError(
+            f"Quiz ID {quiz_id} was not found."
+        )
 
     questions = (
         db.query(QuizQuestion)
@@ -444,7 +486,10 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
     problems = []
     seen_positions = set()
 
-    for expected_position, question in enumerate(questions, start=1):
+    for expected_position, question in enumerate(
+        questions,
+        start=1,
+    ):
         if question.position in seen_positions:
             problems.append(
                 f"Duplicate question position: {question.position}"
@@ -473,14 +518,16 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
         for label, value in options.items():
             if not (value or "").strip():
                 problems.append(
-                    f"Question {expected_position}: option {label} is empty."
+                    f"Question {expected_position}: "
+                    f"option {label} is empty."
                 )
 
         answer = (question.correct_option or "").strip().upper()
 
         if answer not in {"A", "B", "C", "D"}:
             problems.append(
-                f"Question {expected_position}: answer must be A, B, C, or D."
+                f"Question {expected_position}: "
+                "answer must be A, B, C, or D."
             )
 
     batches = (
@@ -490,28 +537,37 @@ def review_quiz_draft(db: Session, quiz_id: int) -> dict:
         .all()
     )
 
+    question_count = len(questions)
+    within_limit = 0 < question_count <= MAX_QUIZ_QUESTIONS
+
     return {
         "quiz_id": quiz.id,
         "title": quiz.title,
         "status": quiz.status,
-        "question_count": len(questions),
+        "question_count": question_count,
         "batch_count": len(batches),
-        "within_limit": 0 < len(questions) <= MAX_QUIZ_QUESTIONS,
+        "within_limit": within_limit,
         "problems": problems,
-        "ready_for_owner_review": (
-            0 < len(questions) <= MAX_QUIZ_QUESTIONS
-            and not problems
-        ),
+        "ready_for_owner_review": within_limit and not problems,
         "published": False,
     }
 
 
-def build_combined_quiz_text(db: Session, quiz_id: int) -> str:
-    """Build one TXT document from every question in position order."""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+def build_combined_quiz_text(
+    db: Session,
+    quiz_id: int,
+) -> str:
+    """Build one text document from all questions in order."""
+    quiz = (
+        db.query(Quiz)
+        .filter(Quiz.id == quiz_id)
+        .first()
+    )
 
     if quiz is None:
-        raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
+        raise QuizImportError(
+            f"Quiz ID {quiz_id} was not found."
+        )
 
     questions = (
         db.query(QuizQuestion)
@@ -521,11 +577,16 @@ def build_combined_quiz_text(db: Session, quiz_id: int) -> str:
     )
 
     if not questions:
-        raise QuizImportError("This draft has no saved questions.")
+        raise QuizImportError(
+            "This draft has no saved questions."
+        )
 
     if len(questions) > MAX_QUIZ_QUESTIONS:
-        raise QuizImportError("Draft exceeds the 200-question limit.")
+        raise QuizImportError(
+            "Draft exceeds the 200-question limit."
+        )
 
+    # Supports both string dates and date/datetime objects.
     quiz_date = (
         quiz.quiz_date.isoformat()
         if hasattr(quiz.quiz_date, "isoformat")
@@ -562,12 +623,21 @@ def build_combined_quiz_text(db: Session, quiz_id: int) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def mark_draft_saved(db: Session, quiz_id: int) -> dict:
-    """Mark a draft as saved without approving or publishing it."""
-    quiz = db.query(Quiz).filter(Quiz.id == quiz_id).first()
+def mark_draft_saved(
+    db: Session,
+    quiz_id: int,
+) -> dict:
+    """Mark a draft as saved, without approving or publishing it."""
+    quiz = (
+        db.query(Quiz)
+        .filter(Quiz.id == quiz_id)
+        .first()
+    )
 
     if quiz is None:
-        raise QuizImportError(f"Quiz ID {quiz_id} was not found.")
+        raise QuizImportError(
+            f"Quiz ID {quiz_id} was not found."
+        )
 
     if quiz.status not in {"draft", "draft_saved"}:
         raise QuizImportError(
