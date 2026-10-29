@@ -1,12 +1,10 @@
 
 """Persistent Telegram poll registry for PH Greybot."""
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import Boolean, ForeignKey, Integer, String, select
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from database import Base, engine
-from sqlalchemy import Boolean, ForeignKey, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column
 
 
 class PollRegistry(Base):
@@ -28,6 +26,11 @@ class PollRegistry(Base):
     attempt_mode: Mapped[str] = mapped_column(
         String(30), default="group_quiz", nullable=False
     )
+    # Each character maps a displayed option index to its original A/B/C/D.
+    # For example, "CADB" means displayed option 0 is original C.
+    option_order: Mapped[str] = mapped_column(
+        String(4), default="ABCD", nullable=False
+    )
 
 
 def init_poll_registry() -> None:
@@ -44,14 +47,24 @@ def register_poll(
     group_id: int | str,
     message_id: int,
     attempt_mode: str = "group_quiz",
+    option_order: str = "ABCD",
 ) -> PollRegistry:
-    """Register a sent poll so incoming answers can be resolved."""
+    """Register a sent poll and preserve its displayed option mapping."""
 
     if not poll_id:
         raise ValueError("Telegram poll ID is required.")
 
     if attempt_mode not in {"group_quiz", "practice"}:
         raise ValueError("Unsupported attempt mode.")
+
+    option_order = option_order.strip().upper()
+    if (
+        len(option_order) != 4
+        or set(option_order) != set("ABCD")
+    ):
+        raise ValueError(
+            "Option order must contain A, B, C, and D exactly once."
+        )
 
     existing = db.scalar(
         select(PollRegistry).where(
@@ -70,6 +83,7 @@ def register_poll(
         message_id=message_id,
         open=True,
         attempt_mode=attempt_mode,
+        option_order=option_order,
     )
 
     db.add(entry)
