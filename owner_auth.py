@@ -1,5 +1,5 @@
 
-"""Owner authorization helpers for PH Greybot."""
+"""Owner authorization helpers for PH Practice Hub."""
 
 from functools import wraps
 
@@ -21,21 +21,32 @@ async def owner_only(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    """Check whether the person invoking a command is the owner."""
+    """Allow owner commands only in the owner's private chat.
 
+    Group commands are silently rejected so owner-only controls
+    do not expose administrative behaviour in group conversations.
+    """
+
+    chat = update.effective_chat
     user = update.effective_user
 
-    if user is not None and is_owner(user.id):
-        return True
+    # Never permit owner commands from groups, supergroups or channels.
+    if chat is None or chat.type != "private":
+        return False
 
-    message = update.effective_message
+    # Validate the actual sender, not merely the chat.
+    if user is None or not is_owner(user.id):
+        message = update.effective_message
 
-    if message is not None:
-        await message.reply_text(
-            "⛔ Access denied. This command is restricted to the bot owner."
-        )
+        if message is not None:
+            await message.reply_text(
+                "⛔ Access denied. This command is restricted "
+                "to the bot owner."
+            )
 
-    return False
+        return False
+
+    return True
 
 
 def owner_command(func):
