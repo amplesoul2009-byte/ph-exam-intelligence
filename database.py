@@ -1,11 +1,12 @@
 
-"""Database models for the new PH Greybot."""
+"""Database models for PH Greybot / PH Practice Hub."""
 
 from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -21,22 +22,19 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
-from config import load_settings
+from config import load_database_url
 
 
-settings = load_settings()
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
+DATABASE_URL = load_database_url()
 
 engine_options = {"pool_pre_ping": True}
 
-if settings.database_url.startswith("sqlite"):
-    engine_options["connect_args"] = {"check_same_thread": False}
+if DATABASE_URL.startswith("sqlite"):
+    engine_options["connect_args"] = {
+        "check_same_thread": False
+    }
 
-engine = create_engine(settings.database_url, **engine_options)
+engine = create_engine(DATABASE_URL, **engine_options)
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -47,6 +45,10 @@ SessionLocal = sessionmaker(
 
 class Base(DeclarativeBase):
     pass
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Quiz(Base):
@@ -60,9 +62,11 @@ class Quiz(Base):
     status: Mapped[str] = mapped_column(
         String(30), default="draft", nullable=False
     )
-    question_count: Mapped[int] = mapped_column(Integer, default=0)
+    question_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
     questions: Mapped[list["QuizQuestion"]] = relationship(
@@ -76,13 +80,16 @@ class QuizQuestion(Base):
     __tablename__ = "quiz_questions"
     __table_args__ = (
         UniqueConstraint(
-            "quiz_id", "position", name="uq_quiz_question_position"
+            "quiz_id",
+            "position",
+            name="uq_quiz_question_position",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     quiz_id: Mapped[int] = mapped_column(
-        ForeignKey("quizzes.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("quizzes.id", ondelete="CASCADE"),
+        nullable=False,
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -91,14 +98,20 @@ class QuizQuestion(Base):
     option_c: Mapped[str] = mapped_column(Text, nullable=False)
     option_d: Mapped[str] = mapped_column(Text, nullable=False)
     correct_option: Mapped[str | None] = mapped_column(String(1))
-    explanation: Mapped[str] = mapped_column(Text, default="")
-    marks: Mapped[float] = mapped_column(default=1.0)
-    negative_marks: Mapped[float] = mapped_column(default=0.25)
+    explanation: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    marks: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    negative_marks: Mapped[float] = mapped_column(
+        Float, default=0.25, nullable=False
+    )
     review_status: Mapped[str] = mapped_column(
         String(30), default="pending", nullable=False
     )
-    analysis_report: Mapped[str] = mapped_column(Text, default="")
-    timer_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    analysis_report: Mapped[str] = mapped_column(
+        Text, default="", nullable=False
+    )
+    timer_seconds: Mapped[int] = mapped_column(
+        Integer, default=30, nullable=False
+    )
 
     quiz: Mapped["Quiz"] = relationship(back_populates="questions")
 
@@ -108,19 +121,30 @@ class ImportBatch(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     quiz_id: Mapped[int] = mapped_column(
-        ForeignKey("quizzes.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("quizzes.id", ondelete="CASCADE"),
+        nullable=False,
     )
-    source_type: Mapped[str] = mapped_column(String(30), default="text")
+    source_type: Mapped[str] = mapped_column(
+        String(30), default="text", nullable=False
+    )
     original_content: Mapped[str] = mapped_column(Text, nullable=False)
-    detected_count: Mapped[int] = mapped_column(Integer, default=0)
-    accepted_count: Mapped[int] = mapped_column(Integer, default=0)
-    warning_count: Mapped[int] = mapped_column(Integer, default=0)
+    detected_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    accepted_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    warning_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     status: Mapped[str] = mapped_column(
         String(30), default="analyzing", nullable=False
     )
-    report_json: Mapped[str] = mapped_column(Text, default="{}")
+    report_json: Mapped[str] = mapped_column(
+        Text, default="{}", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 
@@ -131,10 +155,14 @@ class ApprovedGroup(Base):
     chat_id: Mapped[str] = mapped_column(
         String(100), unique=True, nullable=False
     )
-    chat_title: Mapped[str] = mapped_column(String(200), default="")
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    chat_title: Mapped[str] = mapped_column(
+        String(200), default="", nullable=False
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
     approved_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
 
 
@@ -145,15 +173,25 @@ class QuizAttempt(Base):
     quiz_id: Mapped[int] = mapped_column(
         ForeignKey("quizzes.id"), nullable=False
     )
-    student_id: Mapped[str] = mapped_column(String(100), nullable=False)
-    student_name: Mapped[str] = mapped_column(String(200), default="")
+    student_id: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    student_name: Mapped[str] = mapped_column(
+        String(200), default="", nullable=False
+    )
     group_id: Mapped[str | None] = mapped_column(String(100))
-    score: Mapped[float] = mapped_column(default=0.0)
-    correct_count: Mapped[int] = mapped_column(Integer, default=0)
-    wrong_count: Mapped[int] = mapped_column(Integer, default=0)
-    unanswered_count: Mapped[int] = mapped_column(Integer, default=0)
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    correct_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    wrong_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    unanswered_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utc_now
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
     submitted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
@@ -172,7 +210,8 @@ class AttemptAnswer(Base):
     __tablename__ = "attempt_answers"
     __table_args__ = (
         UniqueConstraint(
-            "attempt_id", "question_id",
+            "attempt_id",
+            "question_id",
             name="uq_attempt_question",
         ),
     )
@@ -183,7 +222,8 @@ class AttemptAnswer(Base):
         nullable=False,
     )
     question_id: Mapped[int] = mapped_column(
-        ForeignKey("quiz_questions.id"), nullable=False
+        ForeignKey("quiz_questions.id"),
+        nullable=False,
     )
     selected_option: Mapped[str | None] = mapped_column(String(1))
     is_correct: Mapped[bool | None] = mapped_column(Boolean)
@@ -196,8 +236,8 @@ class AttemptAnswer(Base):
     )
 
 
-def init_db():
-    """Create tables for a fresh database."""
+def init_db() -> None:
+    """Create missing tables; does not delete existing records."""
     Base.metadata.create_all(bind=engine)
 
 
