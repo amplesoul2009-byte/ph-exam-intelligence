@@ -19,6 +19,7 @@ from telegram import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InputFile,
     Update,
 )
 from telegram.constants import PollType
@@ -107,7 +108,10 @@ async def _send_welcome(message) -> None:
     if animation_id:
         try:
             if len(welcome_text) <= 1024:
-                await message.reply_animation(animation=animation_id, caption=welcome_text)
+                await message.reply_animation(
+                    animation=animation_id,
+                    caption=welcome_text,
+                )
             else:
                 await message.reply_animation(animation=animation_id)
                 await message.reply_text(welcome_text)
@@ -120,7 +124,10 @@ async def _send_welcome(message) -> None:
 
 async def configure_command_menus(application: Application) -> None:
     """Show /start to members and the full command list only to the owner."""
-    member_commands = [BotCommand("start", "Start PH Exam Intelligence")]
+    member_commands = [
+        BotCommand("start", "Start PH Exam Intelligence")
+    ]
+
     owner_commands = [
         BotCommand("start", "Show welcome message"),
         BotCommand("help", "Show help"),
@@ -146,17 +153,35 @@ async def configure_command_menus(application: Application) -> None:
         BotCommand("previewwelcome", "Preview welcome message and GIF"),
         BotCommand("clearwelcomegif", "Remove welcome GIF"),
     ]
+
     try:
-        await application.bot.set_my_commands(member_commands, scope=BotCommandScopeDefault())
-        await application.bot.set_my_commands(member_commands, scope=BotCommandScopeAllPrivateChats())
-        await application.bot.set_my_commands(member_commands, scope=BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(
+            member_commands,
+            scope=BotCommandScopeDefault(),
+        )
+        await application.bot.set_my_commands(
+            member_commands,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await application.bot.set_my_commands(
+            member_commands,
+            scope=BotCommandScopeAllGroupChats(),
+        )
         await application.bot.set_my_commands(
             owner_commands,
-            scope=BotCommandScopeChat(chat_id=load_settings().owner_id),
+            scope=BotCommandScopeChat(
+                chat_id=load_settings().owner_id
+            ),
         )
-        logger.info("Telegram command menus configured for members and owner.")
+
+        logger.info(
+            "Telegram command menus configured for members and owner."
+        )
+
     except TelegramError:
-        logger.exception("Could not configure Telegram command menus")
+        logger.exception(
+            "Could not configure Telegram command menus"
+        )
 
 
 def _message(update: Update):
@@ -174,6 +199,7 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if message:
         await _send_welcome(message)
 
@@ -183,6 +209,7 @@ async def help_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if message:
         await message.reply_text(
             "🪷 PH Exam Intelligence\n\n"
@@ -196,14 +223,25 @@ async def setwelcome_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
+
     if context.args:
-        _set_bot_setting("welcome_text", " ".join(context.args).strip())
-        await message.reply_text("Welcome message updated successfully.")
+        _set_bot_setting(
+            "welcome_text",
+            " ".join(context.args).strip(),
+        )
+        await message.reply_text(
+            "Welcome message updated successfully."
+        )
         return
+
     context.user_data["pending_welcome_text"] = True
-    await message.reply_text("Please send the new welcome message in your next text message.")
+
+    await message.reply_text(
+        "Please send the new welcome message in your next text message."
+    )
 
 
 async def setwelcomegif_command(
@@ -211,27 +249,85 @@ async def setwelcomegif_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
+
     context.user_data["pending_welcome_animation"] = True
-    await message.reply_text("Please send the GIF as an animation in this private chat.")
+
+    await message.reply_text(
+        "Please send the GIF as an animation in this private chat."
+    )
 
 
 async def receive_welcome_animation(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """Save the owner's welcome GIF as animation, video or GIF document."""
+
     message = _message(update)
-    if not message or not context.user_data.get("pending_welcome_animation"):
+
+    if not message:
         return
+
+    if not context.user_data.get("pending_welcome_animation"):
+        return
+
     if not await owner_only(update, context):
         return
-    if not message.animation:
-        await message.reply_text("Please send a GIF using Telegram's animation attachment.")
+
+    file_id = None
+
+    # Telegram animation format
+    if message.animation:
+        file_id = message.animation.file_id
+
+    # Telegram may send the media as a video
+    elif message.video:
+        file_id = message.video.file_id
+
+    # GIF sent as a document
+    elif message.document and (
+        message.document.mime_type == "image/gif"
+        or (message.document.file_name or "").lower().endswith(".gif")
+    ):
+        file_id = message.document.file_id
+
+    if not file_id:
+        await message.reply_text(
+            "I couldn't detect a GIF.\n\n"
+            "Please send a GIF using Telegram's animation attachment "
+            "or send a .gif file as a document."
+        )
         return
-    _set_bot_setting("welcome_animation_file_id", message.animation.file_id)
-    context.user_data.pop("pending_welcome_animation", None)
-    await message.reply_text("Welcome GIF saved successfully.")
+
+    try:
+        _set_bot_setting(
+            "welcome_animation_file_id",
+            file_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to save the welcome GIF in the database"
+        )
+
+        await message.reply_text(
+            "❌ I received the GIF, but couldn't save it.\n"
+            "Please check the database connection and try again."
+        )
+        return
+
+    context.user_data.pop(
+        "pending_welcome_animation",
+        None,
+    )
+
+    await message.reply_text(
+        "✅ Welcome GIF saved successfully!\n\n"
+        "Use /previewwelcome to test it."
+    )
 
 
 async def previewwelcome_command(
@@ -239,6 +335,7 @@ async def previewwelcome_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if message and await owner_only(update, context):
         await _send_welcome(message)
 
@@ -248,9 +345,16 @@ async def clearwelcomegif_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if message and await owner_only(update, context):
-        _set_bot_setting("welcome_animation_file_id", "")
-        await message.reply_text("Welcome GIF removed.")
+        _set_bot_setting(
+            "welcome_animation_file_id",
+            "",
+        )
+
+        await message.reply_text(
+            "Welcome GIF removed."
+        )
 
 
 async def approvegroup(
@@ -258,6 +362,7 @@ async def approvegroup(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -278,8 +383,10 @@ async def approvegroup(
             f"Approved group: {group.chat_id}\n"
             "Only owner-approved groups may receive quizzes."
         )
+
     except Exception as exc:
         logger.exception("Failed to approve group")
+
         await message.reply_text(
             f"Could not approve group: {str(exc)[:500]}"
         )
@@ -290,11 +397,14 @@ async def revokegroup(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     if not context.args:
-        await message.reply_text("Usage: /revokegroup CHAT_ID")
+        await message.reply_text(
+            "Usage: /revokegroup CHAT_ID"
+        )
         return
 
     try:
@@ -306,8 +416,10 @@ async def revokegroup(
             if changed
             else "Group is not active or was not found."
         )
+
     except Exception:
         logger.exception("Failed to revoke group")
+
         await message.reply_text(
             "Could not revoke group. Check the logs."
         )
@@ -318,6 +430,7 @@ async def groups_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -325,10 +438,15 @@ async def groups_command(
         groups = list_approved_groups(db)
 
     if not groups:
-        await message.reply_text("No groups are currently approved.")
+        await message.reply_text(
+            "No groups are currently approved."
+        )
         return
 
-    lines = ["APPROVED TELEGRAM GROUPS", ""]
+    lines = [
+        "APPROVED TELEGRAM GROUPS",
+        "",
+    ]
 
     for group in groups:
         lines.append(
@@ -336,7 +454,9 @@ async def groups_command(
             f"{group['chat_id']}"
         )
 
-    await message.reply_text("\n".join(lines)[:4000])
+    await message.reply_text(
+        "\n".join(lines)[:4000]
+    )
 
 
 # ---------------- SUBJECT MANAGEMENT ----------------
@@ -346,6 +466,7 @@ async def subjects_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -354,12 +475,21 @@ async def subjects_command(
             ensure_default_subjects(db)
             subjects = list_subjects(db)
 
-            lines = ["PH PRACTICE HUB — SUBJECTS", ""]
+            lines = [
+                "PH PRACTICE HUB — SUBJECTS",
+                "",
+            ]
 
             for item in subjects:
-                status = "ACTIVE" if item.active else "DISABLED"
+                status = (
+                    "ACTIVE"
+                    if item.active
+                    else "DISABLED"
+                )
+
                 lines.append(
-                    f"{item.subject_id} — {item.name} [{status}]"
+                    f"{item.subject_id} — "
+                    f"{item.name} [{status}]"
                 )
 
         await message.reply_text(
@@ -367,8 +497,10 @@ async def subjects_command(
             if subjects
             else "No subjects configured."
         )
+
     except Exception:
         logger.exception("Could not list subjects")
+
         await message.reply_text(
             "Could not list subjects. Check deployment logs."
         )
@@ -379,6 +511,7 @@ async def addsubject_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -400,10 +533,13 @@ async def addsubject_command(
             f"Subject ID: {item.subject_id}\n"
             "Use this ID in /importquiz."
         )
+
     except ValueError as exc:
         await message.reply_text(str(exc))
+
     except Exception:
         logger.exception("Could not add subject")
+
         await message.reply_text(
             "Could not add subject. Check deployment logs."
         )
@@ -414,12 +550,15 @@ async def renamesubject_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     parts = " ".join(context.args).split("|", 1)
 
-    if len(parts) != 2 or not all(part.strip() for part in parts):
+    if len(parts) != 2 or not all(
+        part.strip() for part in parts
+    ):
         await message.reply_text(
             "Usage: /renamesubject SUBJECT_ID | NEW NAME\n"
             "Example: /renamesubject current_affairs | Daily CA"
@@ -439,10 +578,13 @@ async def renamesubject_command(
             f"ID: {item.subject_id}\n"
             f"Name: {item.name}"
         )
+
     except ValueError as exc:
         await message.reply_text(str(exc))
+
     except Exception:
         logger.exception("Could not rename subject")
+
         await message.reply_text(
             "Could not rename subject. Check deployment logs."
         )
@@ -453,6 +595,7 @@ async def deletesubject_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -466,16 +609,22 @@ async def deletesubject_command(
 
     try:
         with SessionLocal() as db:
-            item = deactivate_subject(db, context.args[0])
+            item = deactivate_subject(
+                db,
+                context.args[0],
+            )
 
         await message.reply_text(
             f"Subject disabled: {item.name} ({item.subject_id}).\n"
             "Existing quizzes and student results are preserved."
         )
+
     except ValueError as exc:
         await message.reply_text(str(exc))
+
     except Exception:
         logger.exception("Could not disable subject")
+
         await message.reply_text(
             "Could not disable subject. Check deployment logs."
         )
@@ -488,6 +637,7 @@ async def importquiz(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -495,7 +645,10 @@ async def importquiz(
         return
 
     raw = " ".join(context.args).strip()
-    parts = [part.strip() for part in raw.split("|")]
+    parts = [
+        part.strip()
+        for part in raw.split("|")
+    ]
 
     if len(parts) != 4 or not all(parts):
         await message.reply_text(
@@ -508,7 +661,11 @@ async def importquiz(
 
     title, subject, level, quiz_date = parts
 
-    context.user_data.pop("pending_quiz_append", None)
+    context.user_data.pop(
+        "pending_quiz_append",
+        None,
+    )
+
     context.user_data["pending_quiz_import"] = {
         "title": title,
         "subject": subject,
@@ -528,6 +685,7 @@ async def addquestions(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -553,7 +711,11 @@ async def addquestions(
                 )
                 return
 
-        context.user_data.pop("pending_quiz_import", None)
+        context.user_data.pop(
+            "pending_quiz_import",
+            None,
+        )
+
         context.user_data["pending_quiz_append"] = {
             "quiz_id": quiz_id,
         }
@@ -568,6 +730,7 @@ async def addquestions(
 
     except Exception:
         logger.exception("Could not prepare question append")
+
         await message.reply_text(
             "Could not prepare the append operation. Check the logs."
         )
@@ -578,11 +741,19 @@ async def cancelimport(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
-    context.user_data.pop("pending_quiz_import", None)
-    context.user_data.pop("pending_quiz_append", None)
+    context.user_data.pop(
+        "pending_quiz_import",
+        None,
+    )
+
+    context.user_data.pop(
+        "pending_quiz_append",
+        None,
+    )
 
     await message.reply_text(
         "Pending import or append operation cancelled. "
@@ -604,16 +775,35 @@ async def receive_import_text(
 
     if context.user_data.get("pending_welcome_text"):
         value = message.text.strip()
+
         if not value:
-            await message.reply_text("The welcome message cannot be empty.")
+            await message.reply_text(
+                "The welcome message cannot be empty."
+            )
             return
-        _set_bot_setting("welcome_text", value)
-        context.user_data.pop("pending_welcome_text", None)
-        await message.reply_text("Welcome message updated successfully.")
+
+        _set_bot_setting(
+            "welcome_text",
+            value,
+        )
+
+        context.user_data.pop(
+            "pending_welcome_text",
+            None,
+        )
+
+        await message.reply_text(
+            "Welcome message updated successfully."
+        )
         return
 
-    pending_append = context.user_data.get("pending_quiz_append")
-    pending_import = context.user_data.get("pending_quiz_import")
+    pending_append = context.user_data.get(
+        "pending_quiz_append"
+    )
+
+    pending_import = context.user_data.get(
+        "pending_quiz_import"
+    )
 
     if not pending_append and not pending_import:
         return
@@ -631,9 +821,14 @@ async def receive_import_text(
                         max_questions=200,
                     )
 
-            result = await asyncio.to_thread(_append_batch)
+            result = await asyncio.to_thread(
+                _append_batch
+            )
 
-            context.user_data.pop("pending_quiz_append", None)
+            context.user_data.pop(
+                "pending_quiz_append",
+                None,
+            )
 
             await message.reply_text(
                 "QUESTION BATCH APPENDED\n\n"
@@ -652,8 +847,10 @@ async def receive_import_text(
                 "replaced. Correct the batch and send it again, or "
                 "use /cancelimport."
             )
+
         except Exception:
             logger.exception("Question append failed")
+
             await message.reply_text(
                 "Append failed. Check deployment logs before retrying. "
                 "The existing draft should be checked before another attempt."
@@ -666,6 +863,7 @@ async def receive_import_text(
     try:
         def _import_batch():
             settings = load_settings()
+
             with SessionLocal() as db:
                 return import_quiz_text(
                     db,
@@ -678,9 +876,14 @@ async def receive_import_text(
                     max_questions=200,
                 )
 
-        result = await asyncio.to_thread(_import_batch)
+        result = await asyncio.to_thread(
+            _import_batch
+        )
 
-        context.user_data.pop("pending_quiz_import", None)
+        context.user_data.pop(
+            "pending_quiz_import",
+            None,
+        )
 
         await message.reply_text(
             "DRAFT SAVED\n\n"
@@ -702,6 +905,7 @@ async def receive_import_text(
 
     except Exception:
         logger.exception("Quiz import failed")
+
         await message.reply_text(
             "The import failed. Check the deployment logs before retrying."
         )
@@ -714,23 +918,33 @@ async def reviewquiz(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     if len(context.args) != 1 or not _valid_id(context.args[0]):
-        await message.reply_text("Usage: /reviewquiz QUIZ_ID")
+        await message.reply_text(
+            "Usage: /reviewquiz QUIZ_ID"
+        )
         return
 
     quiz_id = int(context.args[0])
 
     try:
         with SessionLocal() as db:
-            report = review_quiz_draft(db, quiz_id)
+            report = review_quiz_draft(
+                db,
+                quiz_id,
+            )
 
         problems = report["problems"]
         ai_findings = report.get("ai_findings", [])
         ai_statuses = report.get("ai_statuses", [])
-        applied_corrections = report.get("applied_corrections", [])
+        applied_corrections = report.get(
+            "applied_corrections",
+            [],
+        )
+
         lines = [
             "DRAFT REVIEW",
             "",
@@ -745,19 +959,27 @@ async def reviewquiz(
         ]
 
         if problems:
-            lines.append(f"Problems found: {len(problems)}")
-            lines.extend(f"- {item}" for item in problems[:25])
+            lines.append(
+                f"Problems found: {len(problems)}"
+            )
+
+            lines.extend(
+                f"- {item}"
+                for item in problems[:25]
+            )
 
             if len(problems) > 25:
                 lines.append(
                     f"...and {len(problems) - 25} more. "
                     "Fix the issues and review again."
                 )
+
         elif report["ready_for_owner_review"]:
             lines.append(
                 "Structural checks passed. Manually verify every "
                 "question, option, answer key and explanation."
             )
+
         else:
             lines.append(
                 "Draft is not ready for owner review. "
@@ -768,21 +990,35 @@ async def reviewquiz(
             lines.extend([
                 "",
                 "CORRECTIONS APPLIED — RECHECK REQUIRED: "
-                + ", ".join(str(value) for value in applied_corrections[:20]),
+                + ", ".join(
+                    str(value)
+                    for value in applied_corrections[:20]
+                ),
             ])
 
         if ai_statuses:
-            lines.extend(["", "VALIDATION STATUS:"])
+            lines.extend([
+                "",
+                "VALIDATION STATUS:",
+            ])
+
             for status in ai_statuses[:10]:
                 lines.append(
                     f"- Batch {status.get('batch_id')}: "
                     f"{status.get('status')} ({status.get('provider')})"
                 )
+
                 if status.get("error"):
-                    lines.append(f"  Note: {status['error'][:180]}")
+                    lines.append(
+                        f"  Note: {status['error'][:180]}"
+                    )
 
         if ai_findings:
-            lines.extend(["", f"AI / PYTHON REVIEW FLAGS: {len(ai_findings)}"])
+            lines.extend([
+                "",
+                f"AI / PYTHON REVIEW FLAGS: {len(ai_findings)}",
+            ])
+
             for finding in ai_findings[:8]:
                 lines.append(
                     f"- Q{finding.get('question_number')} "
@@ -790,38 +1026,69 @@ async def reviewquiz(
                     f"{finding.get('verdict')} — "
                     f"{finding.get('reason') or 'Owner verification required.'}"
                 )
-                correction = finding.get("suggested_correction")
+
+                correction = finding.get(
+                    "suggested_correction"
+                )
+
                 if correction:
                     if correction.get("correct_answer"):
-                        lines.append(f"  Suggested answer: {correction['correct_answer']}")
+                        lines.append(
+                            "  Suggested answer: "
+                            f"{correction['correct_answer']}"
+                        )
+
                     if correction.get("question"):
-                        lines.append(f"  Suggested question: {correction['question'][:220]}")
+                        lines.append(
+                            "  Suggested question: "
+                            f"{correction['question'][:220]}"
+                        )
+
                     if correction.get("options"):
                         for option in "ABCD":
                             lines.append(
-                                f"  {option}) {correction['options'].get(option, '')[:100]}"
+                                f"  {option}) "
+                                f"{correction['options'].get(option, '')[:100]}"
                             )
-                    if correction.get("explanation"):
-                        lines.append(f"  Suggested explanation: {correction['explanation'][:220]}")
-                if finding.get("needs_source_check"):
-                    lines.append("  Verify against an official/current source.")
-            lines.append("AI suggestions are NOT applied automatically.")
-        else:
-            lines.extend(["", "AI flags: None recorded (not proof of correctness)."])
 
-        lines.extend(
-            [
+                    if correction.get("explanation"):
+                        lines.append(
+                            "  Suggested explanation: "
+                            f"{correction['explanation'][:220]}"
+                        )
+
+                if finding.get("needs_source_check"):
+                    lines.append(
+                        "  Verify against an official/current source."
+                    )
+
+            lines.append(
+                "AI suggestions are NOT applied automatically."
+            )
+
+        else:
+            lines.extend([
                 "",
-                "This command does not approve or publish the quiz.",
-            ]
+                "AI flags: None recorded (not proof of correctness).",
+            ])
+
+        lines.extend([
+            "",
+            "This command does not approve or publish the quiz.",
+        ])
+
+        await message.reply_text(
+            "\n".join(lines)[:4000]
         )
 
-        await message.reply_text("\\n".join(lines)[:4000])
-
     except (QuizImportError, ValueError) as exc:
-        await message.reply_text(str(exc)[:1500])
+        await message.reply_text(
+            str(exc)[:1500]
+        )
+
     except Exception:
         logger.exception("Draft review failed")
+
         await message.reply_text(
             "Draft review failed. Check deployment logs."
         )
@@ -832,15 +1099,32 @@ async def applyaifix_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
-    if len(context.args) != 2 or not all(_valid_id(value) for value in context.args):
-        await message.reply_text("Usage: /applyaifix QUIZ_ID QUESTION_POSITION")
+
+    if (
+        len(context.args) != 2
+        or not all(_valid_id(value) for value in context.args)
+    ):
+        await message.reply_text(
+            "Usage: /applyaifix QUIZ_ID QUESTION_POSITION"
+        )
         return
-    quiz_id, position = map(int, context.args)
+
+    quiz_id, position = map(
+        int,
+        context.args,
+    )
+
     try:
         with SessionLocal() as db:
-            result = apply_ai_suggestion(db, quiz_id, position)
+            result = apply_ai_suggestion(
+                db,
+                quiz_id,
+                position,
+            )
+
         await message.reply_text(
             "SUGGESTED CORRECTION APPLIED TO DRAFT\n\n"
             f"Quiz: {result['quiz_id']}\n"
@@ -850,12 +1134,20 @@ async def applyaifix_command(
             "The question remains unapproved. Run /reviewquiz again and "
             "verify the correction before approving."
         )
-    except (QuizImportError, ValueError) as exc:
-        await message.reply_text(str(exc)[:1500])
-    except Exception:
-        logger.exception("Could not apply suggested question correction")
-        await message.reply_text("Could not apply the correction. Check deployment logs.")
 
+    except (QuizImportError, ValueError) as exc:
+        await message.reply_text(
+            str(exc)[:1500]
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not apply suggested question correction"
+        )
+
+        await message.reply_text(
+            "Could not apply the correction. Check deployment logs."
+        )
 
 
 async def savedraft(
@@ -863,22 +1155,34 @@ async def savedraft(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     if len(context.args) != 1 or not _valid_id(context.args[0]):
-        await message.reply_text("Usage: /savedraft QUIZ_ID")
+        await message.reply_text(
+            "Usage: /savedraft QUIZ_ID"
+        )
         return
 
     quiz_id = int(context.args[0])
 
     try:
         with SessionLocal() as db:
-            text_content = build_combined_quiz_text(db, quiz_id)
-            quiz = db.get(Quiz, quiz_id)
+            text_content = build_combined_quiz_text(
+                db,
+                quiz_id,
+            )
+
+            quiz = db.get(
+                Quiz,
+                quiz_id,
+            )
 
             if quiz is None:
-                await message.reply_text("Quiz not found.")
+                await message.reply_text(
+                    "Quiz not found."
+                )
                 return
 
             safe_title = "".join(
@@ -886,13 +1190,21 @@ async def savedraft(
                 for ch in quiz.title
             ).strip("_")[:60] or "quiz"
 
-            filename = f"quiz_{quiz_id}_{safe_title}.txt"
+            filename = (
+                f"quiz_{quiz_id}_{safe_title}.txt"
+            )
 
-        file_buffer = BytesIO(text_content.encode("utf-8"))
+        file_buffer = BytesIO(
+            text_content.encode("utf-8")
+        )
+
         file_buffer.seek(0)
 
         await message.reply_document(
-            document=InputFile(file_buffer, filename=filename),
+            document=InputFile(
+                file_buffer,
+                filename=filename,
+            ),
             caption=(
                 f"Draft export for quiz #{quiz_id}.\n"
                 "This file is a copy; it does not approve or publish the quiz."
@@ -900,7 +1212,10 @@ async def savedraft(
         )
 
         with SessionLocal() as db:
-            result = mark_draft_saved(db, quiz_id)
+            result = mark_draft_saved(
+                db,
+                quiz_id,
+            )
 
         await message.reply_text(
             f"Draft #{quiz_id} saved.\n"
@@ -909,9 +1224,13 @@ async def savedraft(
         )
 
     except (QuizImportError, ValueError) as exc:
-        await message.reply_text(str(exc)[:1500])
+        await message.reply_text(
+            str(exc)[:1500]
+        )
+
     except Exception:
         logger.exception("Draft export failed")
+
         await message.reply_text(
             "Could not export or mark this draft as saved. "
             "Check deployment logs before retrying."
@@ -923,12 +1242,15 @@ async def quizzes_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     with SessionLocal() as db:
         quizzes = db.scalars(
-            select(Quiz).order_by(Quiz.id.desc()).limit(30)
+            select(Quiz)
+            .order_by(Quiz.id.desc())
+            .limit(30)
         ).all()
 
         rows = [
@@ -943,10 +1265,15 @@ async def quizzes_command(
         ]
 
     if not rows:
-        await message.reply_text("No saved quizzes yet.")
+        await message.reply_text(
+            "No saved quizzes yet."
+        )
         return
 
-    lines = ["SAVED QUIZZES", ""]
+    lines = [
+        "SAVED QUIZZES",
+        "",
+    ]
 
     for quiz_id, title, status, count, quiz_date in rows:
         lines.append(
@@ -954,7 +1281,9 @@ async def quizzes_command(
             f"{count} questions | {quiz_date}"
         )
 
-    await message.reply_text("\n".join(lines)[:4000])
+    await message.reply_text(
+        "\n".join(lines)[:4000]
+    )
 
 
 # ---------------- QUIZ APPROVAL ----------------
@@ -964,33 +1293,49 @@ async def approvequiz(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     if len(context.args) != 1 or not _valid_id(context.args[0]):
-        await message.reply_text("Usage: /approvequiz QUIZ_ID")
+        await message.reply_text(
+            "Usage: /approvequiz QUIZ_ID"
+        )
         return
 
     quiz_id = int(context.args[0])
 
     try:
         with SessionLocal() as db:
-            quiz = db.get(Quiz, quiz_id)
+            quiz = db.get(
+                Quiz,
+                quiz_id,
+            )
 
             if quiz is None:
-                await message.reply_text("Quiz not found.")
+                await message.reply_text(
+                    "Quiz not found."
+                )
                 return
 
-            if quiz.status not in {"draft", "draft_saved", "approved"}:
+            if quiz.status not in {
+                "draft",
+                "draft_saved",
+                "approved",
+            }:
                 await message.reply_text(
                     "Only an unpublished draft can be approved."
                 )
                 return
 
-            review = review_quiz_draft(db, quiz_id)
+            review = review_quiz_draft(
+                db,
+                quiz_id,
+            )
 
             if not review["ready_for_owner_review"]:
                 problems = review["problems"]
+
                 lines = [
                     "APPROVAL BLOCKED",
                     "",
@@ -1002,7 +1347,8 @@ async def approvequiz(
                 ]
 
                 lines.extend(
-                    f"- {problem}" for problem in problems[:20]
+                    f"- {problem}"
+                    for problem in problems[:20]
                 )
 
                 if len(problems) > 20:
@@ -1015,7 +1361,9 @@ async def approvequiz(
                     "No approval status was changed.",
                 ])
 
-                await message.reply_text("\n".join(lines)[:4000])
+                await message.reply_text(
+                    "\n".join(lines)[:4000]
+                )
                 return
 
             questions = db.scalars(
@@ -1038,23 +1386,25 @@ async def approvequiz(
                     in {"A", "B", "C", "D"}
                 )
 
-                valid_fields = all(
-                    [
-                        (question.question_text or "").strip(),
-                        (question.option_a or "").strip(),
-                        (question.option_b or "").strip(),
-                        (question.option_c or "").strip(),
-                        (question.option_d or "").strip(),
-                    ]
-                )
+                valid_fields = all([
+                    (question.question_text or "").strip(),
+                    (question.option_a or "").strip(),
+                    (question.option_b or "").strip(),
+                    (question.option_c or "").strip(),
+                    (question.option_d or "").strip(),
+                ])
 
                 if not valid_key or not valid_fields:
-                    invalid_positions.append(question.position)
+                    invalid_positions.append(
+                        question.position
+                    )
 
             if invalid_positions:
                 await message.reply_text(
                     "Approval blocked. Check question(s): "
-                    + ", ".join(map(str, invalid_positions))
+                    + ", ".join(
+                        map(str, invalid_positions)
+                    )
                 )
                 return
 
@@ -1069,9 +1419,13 @@ async def approvequiz(
         )
 
     except (QuizImportError, ValueError) as exc:
-        await message.reply_text(str(exc)[:1500])
+        await message.reply_text(
+            str(exc)[:1500]
+        )
+
     except Exception:
         logger.exception("Quiz approval failed")
+
         await message.reply_text(
             "Quiz approval failed. Check the deployment logs."
         )
@@ -1079,9 +1433,14 @@ async def approvequiz(
 
 # ---------------- QUIZ PUBLISHING ----------------
 
-async def _group_is_approved(chat_id: str | int) -> bool:
+async def _group_is_approved(
+    chat_id: str | int,
+) -> bool:
     with SessionLocal() as db:
-        return is_group_approved(db, chat_id)
+        return is_group_approved(
+            db,
+            chat_id,
+        )
 
 
 async def _run_quiz_publication(
@@ -1101,6 +1460,7 @@ async def _run_quiz_publication(
     before sending the next question. Running this as an application task
     keeps Telegram poll-answer updates processing during the waits.
     """
+
     counts = {
         "sent": 0,
         "invalid_answer_key": 0,
@@ -1109,6 +1469,7 @@ async def _run_quiz_publication(
         "registration_errors": 0,
         "revoked_groups": 0,
     }
+
     sent_groups: set[str] = set()
 
     try:
@@ -1116,12 +1477,13 @@ async def _run_quiz_publication(
             correct_option = question["correct_option"]
             options = question["options"]
 
-            # A structurally invalid question is skipped for every target group.
             if correct_option not in {"A", "B", "C", "D"}:
                 counts["invalid_answer_key"] += len(groups)
+
                 logger.error(
                     "Skipped question %s: invalid answer key %r",
-                    question["position"], correct_option,
+                    question["position"],
+                    correct_option,
                 )
                 continue
 
@@ -1130,20 +1492,26 @@ async def _run_quiz_publication(
                 for option in options
             ):
                 counts["invalid_options"] += len(groups)
+
                 logger.error(
                     "Skipped question %s: one or more options are empty",
                     question["position"],
                 )
                 continue
 
-            timer = max(5, min(int(question["timer_seconds"]), 600))
+            timer = max(
+                5,
+                min(int(question["timer_seconds"]), 600),
+            )
+
             question_sent_count = 0
 
-            # Question-major order: Q1 to all approved groups, then Q2, etc.
             for group in groups:
                 chat_id_text = str(group["chat_id"])
+
                 if not await _group_is_approved(chat_id_text):
                     counts["revoked_groups"] += 1
+
                     logger.warning(
                         "Skipped revoked group %s during publication",
                         chat_id_text,
@@ -1160,14 +1528,22 @@ async def _run_quiz_publication(
                     (label, option[:100])
                     for label, option in zip("ABCD", options)
                 ]
+
                 random.shuffle(displayed_pairs)
+
                 option_order = "".join(
-                    label for label, _ in displayed_pairs
+                    label
+                    for label, _ in displayed_pairs
                 )
+
                 displayed_options = [
-                    option for _, option in displayed_pairs
+                    option
+                    for _, option in displayed_pairs
                 ]
-                correct_option_id = option_order.index(correct_option)
+
+                correct_option_id = option_order.index(
+                    correct_option
+                )
 
                 try:
                     sent_poll = await bot.send_poll(
@@ -1184,11 +1560,14 @@ async def _run_quiz_publication(
                         explanation=question["explanation"][:200],
                         open_period=timer,
                     )
+
                 except TelegramError:
                     counts["telegram_errors"] += 1
+
                     logger.exception(
                         "Telegram failed to publish Q%s to %s",
-                        question["position"], chat_id_text,
+                        question["position"],
+                        chat_id_text,
                     )
                     continue
 
@@ -1204,29 +1583,32 @@ async def _run_quiz_publication(
                             attempt_mode="group_quiz",
                             option_order=option_order,
                         )
+
                     counts["sent"] += 1
                     question_sent_count += 1
                     sent_groups.add(chat_id_text)
+
                 except Exception:
                     counts["registration_errors"] += 1
+
                     logger.exception(
                         "Poll sent but registration failed for Q%s in %s",
-                        question["position"], chat_id_text,
+                        question["position"],
+                        chat_id_text,
                     )
 
-            # Wait only when at least one poll was successfully sent for this
-            # question. The next question starts two seconds after its timer.
             if question_sent_count:
-                await asyncio.sleep(timer + 2)
+                await asyncio.sleep(
+                    timer + 2
+                )
 
-        # Close any still-open registry entries, finalize attempts, then
-        # publish one final leaderboard per group that received a poll.
         for group_id in sorted(sent_groups):
             chat_id = (
                 int(group_id)
                 if group_id.lstrip("-").isdigit()
                 else group_id
             )
+
             with SessionLocal() as db:
                 poll_rows = db.scalars(
                     select(PollRegistry).where(
@@ -1235,6 +1617,7 @@ async def _run_quiz_publication(
                         PollRegistry.open.is_(True),
                     )
                 ).all()
+
                 poll_details = [
                     (poll.poll_id, poll.message_id)
                     for poll in poll_rows
@@ -1246,15 +1629,19 @@ async def _run_quiz_publication(
                         chat_id=chat_id,
                         message_id=message_id,
                     )
+
                 except TelegramError:
-                    # open_period may already have closed the poll.
                     logger.info(
                         "Poll %s was already closed or could not be stopped",
                         poll_id,
                     )
+
                 finally:
                     with SessionLocal() as db:
-                        close_poll(db, poll_id)
+                        close_poll(
+                            db,
+                            poll_id,
+                        )
 
             with SessionLocal() as db:
                 attempts = db.scalars(
@@ -1264,30 +1651,47 @@ async def _run_quiz_publication(
                         QuizAttempt.status == "in_progress",
                     )
                 ).all()
-                attempt_ids = [attempt.id for attempt in attempts]
+
+                attempt_ids = [
+                    attempt.id
+                    for attempt in attempts
+                ]
 
             for attempt_id in attempt_ids:
                 try:
                     with SessionLocal() as db:
-                        finalize_attempt(db, attempt_id=attempt_id)
+                        finalize_attempt(
+                            db,
+                            attempt_id=attempt_id,
+                        )
+
                 except Exception:
                     logger.exception(
-                        "Could not finalize attempt %s", attempt_id
+                        "Could not finalize attempt %s",
+                        attempt_id,
                     )
 
             try:
                 if await _group_is_approved(group_id):
                     await publish_group_leaderboard(
-                        bot, chat_id, quiz_id
+                        bot,
+                        chat_id,
+                        quiz_id,
                     )
+
             except Exception:
                 logger.exception(
                     "Final leaderboard failed for quiz %s in group %s",
-                    quiz_id, group_id,
+                    quiz_id,
+                    group_id,
                 )
 
         with SessionLocal() as db:
-            quiz = db.get(Quiz, quiz_id)
+            quiz = db.get(
+                Quiz,
+                quiz_id,
+            )
+
             if quiz is not None and counts["sent"] > 0:
                 quiz.status = "published"
                 db.commit()
@@ -1307,8 +1711,13 @@ async def _run_quiz_publication(
                 "published for groups that received polls."
             ),
         )
+
     except Exception:
-        logger.exception("Sequential publication crashed for quiz %s", quiz_id)
+        logger.exception(
+            "Sequential publication crashed for quiz %s",
+            quiz_id,
+        )
+
         try:
             await bot.send_message(
                 chat_id=owner_chat_id,
@@ -1318,12 +1727,17 @@ async def _run_quiz_publication(
                     "Check deployment logs before retrying."
                 ),
             )
+
         except Exception:
-            logger.exception("Could not notify owner about publication failure")
+            logger.exception(
+                "Could not notify owner about publication failure"
+            )
+
     finally:
-        application.bot_data.setdefault("publishing_quizzes", set()).discard(
-            quiz_id
-        )
+        application.bot_data.setdefault(
+            "publishing_quizzes",
+            set(),
+        ).discard(quiz_id)
 
 
 async def publishquiz(
@@ -1331,17 +1745,23 @@ async def publishquiz(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
     if len(context.args) != 1 or not _valid_id(context.args[0]):
-        await message.reply_text("Usage: /publishquiz QUIZ_ID")
+        await message.reply_text(
+            "Usage: /publishquiz QUIZ_ID"
+        )
         return
 
     quiz_id = int(context.args[0])
+
     active_publications = context.application.bot_data.setdefault(
-        "publishing_quizzes", set()
+        "publishing_quizzes",
+        set(),
     )
+
     if quiz_id in active_publications:
         await message.reply_text(
             f"Quiz #{quiz_id} is already being published question by question."
@@ -1349,9 +1769,15 @@ async def publishquiz(
         return
 
     with SessionLocal() as db:
-        quiz = db.get(Quiz, quiz_id)
+        quiz = db.get(
+            Quiz,
+            quiz_id,
+        )
+
         if quiz is None:
-            await message.reply_text("Quiz not found.")
+            await message.reply_text(
+                "Quiz not found."
+            )
             return
 
         if quiz.status not in {"approved"}:
@@ -1366,15 +1792,24 @@ async def publishquiz(
             .where(QuizQuestion.quiz_id == quiz_id)
             .order_by(QuizQuestion.position)
         ).all()
+
         groups = list_approved_groups(db)
         title = quiz.title
+
         question_data = [
             {
                 "id": q.id,
                 "position": q.position,
                 "question_text": q.question_text,
-                "options": [q.option_a, q.option_b, q.option_c, q.option_d],
-                "correct_option": (q.correct_option or "").strip().upper(),
+                "options": [
+                    q.option_a,
+                    q.option_b,
+                    q.option_c,
+                    q.option_d,
+                ],
+                "correct_option": (
+                    q.correct_option or ""
+                ).strip().upper(),
                 "explanation": q.explanation or "",
                 "timer_seconds": q.timer_seconds or 30,
             }
@@ -1387,11 +1822,15 @@ async def publishquiz(
             "/approvegroup CHAT_ID."
         )
         return
+
     if not question_data:
-        await message.reply_text("This quiz has no questions.")
+        await message.reply_text(
+            "This quiz has no questions."
+        )
         return
 
     active_publications.add(quiz_id)
+
     context.application.create_task(
         _run_quiz_publication(
             bot=context.bot,
@@ -1423,6 +1862,7 @@ async def endquiz(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = _message(update)
+
     if not message or not await owner_only(update, context):
         return
 
@@ -1431,7 +1871,9 @@ async def endquiz(
         or not _valid_id(context.args[0])
         or not context.args[1].lstrip("-").isdigit()
     ):
-        await message.reply_text("Usage: /endquiz QUIZ_ID CHAT_ID")
+        await message.reply_text(
+            "Usage: /endquiz QUIZ_ID CHAT_ID"
+        )
         return
 
     quiz_id = int(context.args[0])
@@ -1466,11 +1908,17 @@ async def endquiz(
                 chat_id=chat_id,
                 message_id=message_id,
             )
+
         except TelegramError:
-            logger.info("Poll %s may already be closed", poll_id)
+            logger.info(
+                "Poll %s may already be closed",
+                poll_id,
+            )
+
         except Exception:
             logger.exception(
-                "Unexpected error stopping poll %s", poll_id
+                "Unexpected error stopping poll %s",
+                poll_id,
             )
 
         with SessionLocal() as db:
@@ -1486,18 +1934,27 @@ async def endquiz(
             )
         ).all()
 
-        attempt_ids = [attempt.id for attempt in attempts]
+        attempt_ids = [
+            attempt.id
+            for attempt in attempts
+        ]
 
     finalized_count = 0
 
     for attempt_id in attempt_ids:
         try:
             with SessionLocal() as db:
-                finalize_attempt(db, attempt_id=attempt_id)
+                finalize_attempt(
+                    db,
+                    attempt_id=attempt_id,
+                )
+
             finalized_count += 1
+
         except Exception:
             logger.exception(
-                "Failed to finalize attempt %s", attempt_id
+                "Failed to finalize attempt %s",
+                attempt_id,
             )
 
     try:
@@ -1506,8 +1963,12 @@ async def endquiz(
             chat_id,
             quiz_id,
         )
+
     except Exception:
-        logger.exception("Leaderboard publication failed")
+        logger.exception(
+            "Leaderboard publication failed"
+        )
+
         await message.reply_text(
             "Polls were closed and attempts finalized, but leaderboard "
             "publication failed. Check the deployment logs."
@@ -1539,37 +2000,109 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setwelcome", setwelcome_command))
-    app.add_handler(CommandHandler("setwelcomegif", setwelcomegif_command))
-    app.add_handler(CommandHandler("previewwelcome", previewwelcome_command))
-    app.add_handler(CommandHandler("clearwelcomegif", clearwelcomegif_command))
-
-    app.add_handler(CommandHandler("approvegroup", approvegroup))
-    app.add_handler(CommandHandler("revokegroup", revokegroup))
-    app.add_handler(CommandHandler("groups", groups_command))
-
-    app.add_handler(CommandHandler("subjects", subjects_command))
-    app.add_handler(CommandHandler("addsubject", addsubject_command))
-    app.add_handler(CommandHandler("renamesubject", renamesubject_command))
-    app.add_handler(CommandHandler("deletesubject", deletesubject_command))
-
-    app.add_handler(CommandHandler("importquiz", importquiz))
-    app.add_handler(CommandHandler("addquestions", addquestions))
-    app.add_handler(CommandHandler("cancelimport", cancelimport))
-    app.add_handler(CommandHandler("quizzes", quizzes_command))
-    app.add_handler(CommandHandler("reviewquiz", reviewquiz))
-    app.add_handler(CommandHandler("applyaifix", applyaifix_command))
-    app.add_handler(CommandHandler("savedraft", savedraft))
-    app.add_handler(CommandHandler("approvequiz", approvequiz))
-    app.add_handler(CommandHandler("publishquiz", publishquiz))
-    app.add_handler(CommandHandler("endquiz", endquiz))
-
     app.add_handler(
-        MessageHandler(filters.ANIMATION, receive_welcome_animation)
+        CommandHandler("start", start)
     )
 
+    app.add_handler(
+        CommandHandler("help", help_command)
+    )
+
+    app.add_handler(
+        CommandHandler("setwelcome", setwelcome_command)
+    )
+
+    app.add_handler(
+        CommandHandler("setwelcomegif", setwelcomegif_command)
+    )
+
+    app.add_handler(
+        CommandHandler("previewwelcome", previewwelcome_command)
+    )
+
+    app.add_handler(
+        CommandHandler("clearwelcomegif", clearwelcomegif_command)
+    )
+
+    app.add_handler(
+        CommandHandler("approvegroup", approvegroup)
+    )
+
+    app.add_handler(
+        CommandHandler("revokegroup", revokegroup)
+    )
+
+    app.add_handler(
+        CommandHandler("groups", groups_command)
+    )
+
+    app.add_handler(
+        CommandHandler("subjects", subjects_command)
+    )
+
+    app.add_handler(
+        CommandHandler("addsubject", addsubject_command)
+    )
+
+    app.add_handler(
+        CommandHandler("renamesubject", renamesubject_command)
+    )
+
+    app.add_handler(
+        CommandHandler("deletesubject", deletesubject_command)
+    )
+
+    app.add_handler(
+        CommandHandler("importquiz", importquiz)
+    )
+
+    app.add_handler(
+        CommandHandler("addquestions", addquestions)
+    )
+
+    app.add_handler(
+        CommandHandler("cancelimport", cancelimport)
+    )
+
+    app.add_handler(
+        CommandHandler("quizzes", quizzes_command)
+    )
+
+    app.add_handler(
+        CommandHandler("reviewquiz", reviewquiz)
+    )
+
+    app.add_handler(
+        CommandHandler("applyaifix", applyaifix_command)
+    )
+
+    app.add_handler(
+        CommandHandler("savedraft", savedraft)
+    )
+
+    app.add_handler(
+        CommandHandler("approvequiz", approvequiz)
+    )
+
+    app.add_handler(
+        CommandHandler("publishquiz", publishquiz)
+    )
+
+    app.add_handler(
+        CommandHandler("endquiz", endquiz)
+    )
+
+    # GIF receiver: handles Telegram animations, videos and GIF documents.
+    app.add_handler(
+        MessageHandler(
+            filters.ANIMATION
+            | filters.VIDEO
+            | filters.Document.MimeType("image/gif"),
+            receive_welcome_animation,
+        )
+    )
+
+    # Text receiver: handles pending welcome text and quiz imports.
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1579,8 +2112,13 @@ def main() -> None:
 
     install_poll_answer_handler(app)
 
-    logger.info("PH Practice Hub bot starting in polling mode.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info(
+        "PH Practice Hub bot starting in polling mode."
+    )
+
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
 
 
 if __name__ == "__main__":
