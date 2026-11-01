@@ -1,9 +1,19 @@
 
-"""Parse and validate the structure of imported quiz text."""
+"""Conservative quiz text parser for PH Practice Hub.
+
+Supports numbered questions, A-D options, answer keys and explanations.
+Recognises common quiz headings and section labels without treating them
+as malformed questions.
+
+Question-level structural problems remain attached to the affected
+question for manual review. The parser never invents or changes answers.
+"""
+
+from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 
 QUESTION_START = re.compile(
@@ -17,166 +27,175 @@ OPTION_LINE = re.compile(
 )
 
 ANSWER_LINE = re.compile(
-    r"^\s*(?:correct\s+answer|answer|ans|key)\s*[:=-]\s*"
-    r"([A-D])\b",
+    r"^\s*(?:correct\s+answer|answer|ans|key)\s*[:.)-]\s*"
+    r"(?:option\s*)?[\(\[]?([A-D])[\)\]]?\s*$",
     re.IGNORECASE,
 )
 
 EXPLANATION_LINE = re.compile(
-    r"^\s*(?:explanation|solution|reason)\s*[:=-]\s*(.*)$",
+    r"^\s*(?:explanation|solution|reason)\s*[:.)-]\s*(.*?)\s*$",
     re.IGNORECASE,
+)
+
+IGNORABLE_LINE = re.compile(
+    r"""
+    ^\s*(
+        PH\s+PRACTICE\s+HUB
+        |PH\s+MOCK(?:ORBIT)?
+        |SEPTEMBER\s+\d{4}\s+CURRENT\s+AFFAIRS(?:\s*[-—:].*)?
+        |TOTAL\s+QUESTIONS?\s*[:=-]?.*
+        |LEVEL\s*[:=-]?.*
+        |MARKS?\s*[:=-]?.*
+        |NEGATIVE\s+MARKS?\s*[:=-]?.*
+        |IMPORTANT\s+NOTE\s*[:=-]?.*
+        |SSC\s*\|.*
+        |SECTION\s+[A-Z0-9IVX]+(?:\s*[-—:].*)?
+        |END\s+OF\s+SET
+        |STATUS\s*[:=-]?.*
+        |TITLE\s*[:=-]?.*
+        |SUBJECT\s*[:=-]?.*
+        |DATE\s*[:=-]?.*
+        |BATCH\s*[:=-]?.*
+        |={3,}
+        |-{3,}
+        |\*{3,}
+        |_ {3,}
+    )\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
 @dataclass
 class ParsedQuestion:
     number: int
-    question: str
-    options: dict[str, str] = field(default_factory=dict)
+    question: str = ""
+    options: Dict[str, str] = field(default_factory=dict)
     correct_option: Optional[str] = None
     explanation: str = ""
-    warnings: list[str] = field(default_factory=list)
-
-    def to_dict(self):
-        return asdict(self)
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
 class ParseResult:
-    questions: list[ParsedQuestion]
-    errors: list[str]
-    warnings: list[str]
-
-    def to_dict(self):
-        return {
-            "questions": [q.to_dict() for q in self.questions],
-            "errors": self.errors,
-            "warnings": self.warnings,
-            "detected_count": len(self.questions),
-            "valid_count": sum(
-                not q.warnings
-                and len(q.options) == 4
-                and q.correct_option is not None
-                for q in self.questions
-            ),
-        }
+    questions: List[ParsedQuestion] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
 
-def parse_quiz_text(text: str, max_questions: int = 200) -> ParseResult:
-    """Parse plain-text MCQs without inventing missing information."""
+def _is_ignorable_line(line: str) -> bool:
+    """Return True for recognised document headings and separators."""
+    return bool(IGNORABLE_LINE.match(line.strip()))
+
+
+def _finish_question(question: ParsedQuestion) -> None:
+    """Attach structural validation warnings to one question."""
+    if not question.question.strip():
+        question.warnings.append("Question text is missing.")
+
+    for option in "ABCD":
+        if option not in question.options:
+            question.warnings.append(f"Option {option} is missing.")
+        elif not question.options[option].strip():
+            question.warnings.append(f"Option {option} is empty.")
+
+    if question.correct_option not in set("ABCD"):
+        question.warnings.append("A valid answer key (A-D) is missing.")
+
+    if not question.explanation.strip():
+        question.warnings.append("Explanation is missing.")
+
+
+def parse_quiz_text(
+    text: str,
+    max_questions: int = 200,
+) -> ParseResult:
+    """Parse pasted quiz text into question records.
+
+    The parser preserves question content and never guesses answer keys.
+    Text outside question blocks is recorded as a global warning.
+    """
+
+    result = ParseResult()
 
     if not isinstance(text, str) or not text.strip():
-        return ParseResult([], ["No quiz text provided."], [])
+        result.errors.append("Quiz text is empty.")
+        return result
 
-    if not 1 <= max_questions <= 200:
-        return ParseResult(
-            [], ["max_questions must be between 1 and 200."], []
-        )
+    if not isinstance(max_questions, int) or not 1 <= max_questions <= 200:
+        result.errors.append("max_questions must be between 1 and 200.")
+        return result
 
-    questions: list[ParsedQuestion] = []
-    errors: list[str] = []
-    global_warnings: list[str] = []
     current: Optional[ParsedQuestion] = None
-    mode = "question"
-    last_option: Optional[str] = None
+    seen_numbers = set()
+    outside_lines = []
 
-    def finish_question():
-        nonlocal current, mode, last_option
+    def finish_current() -> None:
+        nonlocal current
+        if current is not None:
+            _finish_question(current)
+            result.questions.append(current)
+            current = None
 
-        if current is None:
-            return
-
-        current.question = current.question.strip()
-
-        if not current.question:
-            current.warnings.append("Question text is missing.")
-
-        for label in "ABCD":
-            if label not in current.options:
-                current.warnings.append(
-                    f"Option {label} is missing."
-                )
-
-        if current.correct_option is None:
-            current.warnings.append("Correct answer is missing.")
-        elif current.correct_option not in current.options:
-            current.warnings.append(
-                "Answer key points to an option that is missing."
-            )
-
-        if len(current.options) != 4:
-            current.warnings.append(
-                f"Expected four options; found {len(current.options)}."
-            )
-
-        if len(current.warnings) > 0:
-            global_warnings.append(
-                f"Question {current.number}: "
-                + "; ".join(current.warnings)
-            )
-
-        questions.append(current)
-        current = None
-        mode = "question"
-        last_option = None
-
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-
-    for line_number, raw_line in enumerate(lines, start=1):
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
 
         if not line:
             continue
 
-        q_match = QUESTION_START.match(line)
+        if _is_ignorable_line(line):
+            continue
 
-        # A new numbered question begins a new record.
-        if q_match:
-            number = int(q_match.group(1))
-            body = q_match.group(2).strip()
+        question_match = QUESTION_START.match(line)
 
-            if current is not None:
-                finish_question()
+        if question_match:
+            finish_current()
 
-            if len(questions) >= max_questions:
-                errors.append(
-                    f"Import stopped at line {line_number}: "
-                    f"maximum of {max_questions} questions reached."
+            number = int(question_match.group(1))
+            question_text = question_match.group(2).strip()
+
+            if number in seen_numbers:
+                result.warnings.append(
+                    f"Question number {number} appears more than once."
                 )
+
+            seen_numbers.add(number)
+
+            current = ParsedQuestion(
+                number=number,
+                question=question_text,
+            )
+
+            if len(result.questions) >= max_questions:
+                result.errors.append(
+                    f"Question limit of {max_questions} exceeded."
+                )
+                current = None
                 break
 
-            current = ParsedQuestion(number=number, question=body)
-            mode = "question"
-            last_option = None
             continue
 
         if current is None:
-            errors.append(
-                f"Line {line_number} is outside a recognised question: "
-                f"{line[:100]}"
-            )
+            outside_lines.append((line_number, line))
             continue
 
         option_match = OPTION_LINE.match(line)
 
         if option_match:
-            label = next(
-                group for group in option_match.groups()[:3]
-                if group is not None
+            option_letter = (
+                option_match.group(1)
+                or option_match.group(2)
+                or option_match.group(3)
             ).upper()
-            value = option_match.group(4).strip()
+            option_text = option_match.group(4).strip()
 
-            if not value:
-                current.warnings.append(f"Option {label} is empty.")
-            elif label in current.options:
+            if option_letter in current.options:
                 current.warnings.append(
-                    f"Option {label} appears more than once."
+                    f"Option {option_letter} is duplicated."
                 )
             else:
-                current.options[label] = value
+                current.options[option_letter] = option_text
 
-            mode = "option"
-            last_option = label
             continue
 
         answer_match = ANSWER_LINE.match(line)
@@ -185,57 +204,49 @@ def parse_quiz_text(text: str, max_questions: int = 200) -> ParseResult:
             answer = answer_match.group(1).upper()
 
             if current.correct_option is not None:
-                current.warnings.append(
-                    "Multiple answer keys were provided."
-                )
+                current.warnings.append("Answer key is duplicated.")
             else:
                 current.correct_option = answer
 
-            mode = "answer"
-            last_option = None
             continue
 
         explanation_match = EXPLANATION_LINE.match(line)
 
         if explanation_match:
-            current.explanation = explanation_match.group(1).strip()
-            mode = "explanation"
-            last_option = None
+            explanation_text = explanation_match.group(1).strip()
+
+            if current.explanation:
+                current.explanation += "\n" + explanation_text
+            else:
+                current.explanation = explanation_text
+
             continue
 
-        # Unlabelled lines are appended only to the active field.
-        if mode == "option" and last_option:
-            current.options[last_option] += "\n" + line
-        elif mode == "explanation":
+        # Preserve unrecognised lines as part of the question or explanation.
+        if current.explanation:
             current.explanation += "\n" + line
-        elif mode == "question":
+        elif not current.options:
             current.question += "\n" + line
         else:
+            # Do not silently discard text after the options begin.
             current.warnings.append(
-                f"Unrecognised line {line_number}: {line[:100]}"
+                f"Unrecognised content at line {line_number}: {line[:120]}"
             )
 
-    finish_question()
+    finish_current()
 
-    if not questions and not errors:
-        errors.append(
-            "No numbered questions were detected. "
-            "Use question numbers such as '1.' or 'Q1.'"
+    if outside_lines:
+        result.warnings.append(
+            f"{len(outside_lines)} line(s) outside recognised question "
+            "blocks were ignored as document preamble or formatting."
         )
 
-    # Duplicate question numbers are flagged, not automatically renumbered.
-    seen_numbers = set()
-    for question in questions:
-        if question.number in seen_numbers:
-            warning = (
-                f"Question number {question.number} is duplicated."
-            )
-            question.warnings.append(warning)
-            global_warnings.append(warning)
-        seen_numbers.add(question.number)
+    if not result.questions and not result.errors:
+        result.errors.append("No numbered questions were detected.")
 
-    return ParseResult(
-        questions=questions,
-        errors=errors,
-        warnings=global_warnings,
-    )
+    if len(result.questions) > max_questions:
+        result.errors.append(
+            f"Question limit of {max_questions} exceeded."
+        )
+
+    return result
